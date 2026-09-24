@@ -1,0 +1,438 @@
+diff --git a/docs/frame.schema.json b/docs/frame.schema.json
+index da316f4..9e43863 100644
+--- a/docs/frame.schema.json
++++ b/docs/frame.schema.json
+@@ -16,3 +16,3 @@
+     "commandName": {
+-      "enum": ["send_instruction", "pause", "resume", "approve", "reject", "request_diff", "request_status", "request_task_state", "request_events"]
++      "enum": ["send_instruction", "pause", "resume", "approve", "reject", "request_diff", "request_status", "request_task_state", "request_events", "request_transcript"]
+     },
+@@ -45,3 +45,3 @@
+         "sessionId": { "$ref": "#/$defs/sessionId" }, "text": { "type": "string", "maxLength": 8000 },
+-        "after": { "type": "integer", "minimum": 0 }
++        "after": { "type": "integer", "minimum": 0 }, "afterEntryId": { "$ref": "#/$defs/id" }
+       }, "additionalProperties": true
+@@ -52,3 +52,3 @@
+         "v": { "const": 1 }, "op": { "const": "command" }, "id": { "$ref": "#/$defs/id" },
+-        "command": { "$ref": "#/$defs/commandName" }, "text": { "type": "string" }
++        "command": { "$ref": "#/$defs/commandName" }, "text": { "type": "string" }, "afterEntryId": { "$ref": "#/$defs/id" }
+       }, "additionalProperties": true
+diff --git a/docs/protocol.md b/docs/protocol.md
+index eadcb31..db8bd78 100644
+--- a/docs/protocol.md
++++ b/docs/protocol.md
+@@ -2,3 +2,3 @@
+ 
+-Unix domain socket上でUTF-8のJSON objectをLF (`\n`) 区切りで流します。各frameは最大64 KiB、`v: 1` 必須です。socketは利用者専用ディレクトリ内に作成し、socket modeは0600です。PiのRPC protocolとは別物です。
++Unix domain socket上でUTF-8のJSON objectをLF (`\n`) 区切りで流します。各frameは最大8 MiB、`v: 1` 必須です。socketは利用者専用ディレクトリ内に作成し、socket modeは0600です。PiのRPC protocolとは別物です。
+ Frameの機械可読な定義は[frame.schema.json](frame.schema.json)です。
+@@ -33,2 +33,3 @@ Frameの機械可読な定義は[frame.schema.json](frame.schema.json)です。
+ | `request_events` | 実装済み | 指定sessionの直近100件から、`after`より新しい最大50件とcursorを取得。欠落時は`dropped`を返す |
++| `request_transcript` | 実装済み | 接続中Piのcompaction-aware contextから表示可能な会話を最大80 entry・6 MiBずつ取得。`afterEntryId`で増分取得する。user/assistant、`display: true`のcustom message、tool call/arguments/result、bash command/output/status、画像を含む。system prompt、hidden thinking、compaction/branch summaryは除外し、bridge側へ保存しない |
+ | `request_task_state` | 実装済み | 接続中PiのStepstone Session Tasksを最大100件取得。Goalは含まない |
+@@ -45,2 +46,4 @@ Frameの機械可読な定義は[frame.schema.json](frame.schema.json)です。
+ 
++`request_transcript`はweb consoleから既定で取得します。tool arguments/outputと画像を含む会話内容が、bridge daemonを経由して許可済みweb browserへ送信されます。Pi extensionはactive branchのcompaction-aware contextからその場で返し、bridge daemonはtranscriptをsnapshot・JSONL event logへ保存しません。画面側も受け取った内容をブラウザのメモリにだけ保持します。ネットワーク公開する場合は、信頼できるHTTPS/VPN proxyの認証とアクセス制御を必須にしてください。
++
+ bridgeのスナップショットはsession id、cwd、status、telemetry、接続状態、時刻、比較用metadata、直近100件の通知用eventを保持します。イベントログはsession単位のJSONLです。`request_events`はsnapshot内の直近eventをcursorで読み、古いeventが失われた場合は`dropped: true`を返します。作業状態の正本はStepstoneのPi custom entry（Session Tasks）と`.worklist/worklist.json`（Project Goals）です。`request_task_state`は接続中Piのsession treeを読むだけで、bridgeのsnapshotへTask・Goal詳細は保存しません。Piが未接続ならエラーを返します。
+diff --git a/extensions/bridge.ts b/extensions/bridge.ts
+index e970390..b317061 100644
+--- a/extensions/bridge.ts
++++ b/extensions/bridge.ts
+@@ -6,2 +6,11 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
+ const MAX_LINE_BYTES = 64 * 1024;
++const MAX_TRANSCRIPT_LINE_BYTES = 8 * 1024 * 1024;
++const MAX_TRANSCRIPT_MESSAGES = 80;
++const MAX_TRANSCRIPT_BYTES = 6 * 1024 * 1024;
++const MAX_TRANSCRIPT_TEXT_BYTES = 128 * 1024;
++const MAX_TRANSCRIPT_IMAGE_BYTES = 2 * 1024 * 1024;
++const MAX_TRANSCRIPT_TOOL_ARGUMENT_BYTES = 64 * 1024;
++const MAX_TRANSCRIPT_ENTRY_BYTES = 3 * 1024 * 1024;
++const MAX_TRANSCRIPT_ENTRY_CONTENT_BYTES = MAX_TRANSCRIPT_ENTRY_BYTES - 256 * 1024;
++const TRANSCRIPT_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+ const path = process.env.PI_HARNESS_SOCKET || join(tmpdir(), `pi-harness-${process.getuid?.() ?? "user"}`, "bridge.sock");
+@@ -27,2 +36,175 @@ function readTaskState(ctx: ExtensionContext) {
+ 
++function cleanTranscriptText(value: string): string {
++  return value.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, " ");
++}
++
++function truncateUtf8(value: string, maxBytes: number): { text: string; truncated: boolean } {
++  const cleaned = cleanTranscriptText(value);
++  if (Buffer.byteLength(cleaned, "utf8") <= maxBytes) return { text: cleaned, truncated: false };
++  if (maxBytes <= 0) return { text: "", truncated: true };
++  const fullSuffix = "\n…（省略）";
++  const suffix = Buffer.byteLength(fullSuffix, "utf8") <= maxBytes ? fullSuffix : maxBytes >= 3 ? "…" : ".".repeat(maxBytes);
++  const budget = maxBytes - Buffer.byteLength(suffix, "utf8");
++  let text = "";
++  let bytes = 0;
++  for (const character of cleaned) {
++    const size = Buffer.byteLength(character, "utf8");
++    if (bytes + size > budget) break;
++    text += character;
++    bytes += size;
++  }
++  return { text: text.trimEnd() + suffix, truncated: true };
++}
++
++function transcriptBlocks(content: unknown) {
++  const blocks: Record<string, unknown>[] = [];
++  let textBytes = 0;
++  let imageBytes = 0;
++  let blocksBytes = 2; // JSON encoding of an empty array.
++  let truncated = false;
++  const values = typeof content === "string" ? [{ type: "text", text: content }] : Array.isArray(content) ? content : [];
++  const appendBlock = (block: Record<string, unknown>) => {
++    const size = Buffer.byteLength(JSON.stringify(block), "utf8") + (blocks.length > 0 ? 1 : 0);
++    if (blocksBytes + size > MAX_TRANSCRIPT_ENTRY_CONTENT_BYTES) {
++      truncated = true;
++      const placeholder = { type: "text", text: "[Transcript content omitted at the entry size limit]" };
++      const placeholderSize = Buffer.byteLength(JSON.stringify(placeholder), "utf8") + (blocks.length > 0 ? 1 : 0);
++      if (blocksBytes + placeholderSize <= MAX_TRANSCRIPT_ENTRY_CONTENT_BYTES) blocks.push(placeholder);
++      return false;
++    }
++    blocks.push(block);
++    blocksBytes += size;
++    return true;
++  };
++
++  for (const value of values) {
++    if (!value || typeof value !== "object") continue;
++    const item = value as Record<string, unknown>;
++    if (item.type === "text" && typeof item.text === "string") {
++      const remaining = MAX_TRANSCRIPT_TEXT_BYTES - textBytes;
++      if (remaining <= 0) { truncated = true; continue; }
++      const limited = truncateUtf8(item.text, remaining);
++      textBytes += Buffer.byteLength(limited.text, "utf8");
++      if (!appendBlock({ type: "text", text: limited.text })) break;
++      truncated ||= limited.truncated;
++    } else if (item.type === "image") {
++      const mimeType = typeof item.mimeType === "string" ? item.mimeType.toLowerCase() : "";
++      const data = typeof item.data === "string" ? item.data : "";
++      const size = Buffer.byteLength(data, "utf8");
++      if (TRANSCRIPT_IMAGE_TYPES.has(mimeType) && data.length > 0 && data.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(data) && size <= MAX_TRANSCRIPT_IMAGE_BYTES - imageBytes) {
++        if (!appendBlock({ type: "image", mimeType, data })) break;
++        imageBytes += size;
++      } else {
++        if (!appendBlock({ type: "text", text: "[画像は形式またはサイズ上限により省略]" })) break;
++        truncated = true;
++      }
++    } else if (item.type === "toolCall" && typeof item.name === "string") {
++      let argumentsText = "{}";
++      try { argumentsText = JSON.stringify(item.arguments ?? {}) ?? "{}"; } catch { argumentsText = "[引数を読み取れません]"; }
++      const limited = truncateUtf8(argumentsText, MAX_TRANSCRIPT_TOOL_ARGUMENT_BYTES);
++      if (!appendBlock({
++        type: "toolCall", name: item.name.slice(0, 120),
++        ...(typeof item.id === "string" ? { id: item.id.slice(0, 128) } : {}),
++        arguments: limited.text,
++      })) break;
++      truncated ||= limited.truncated;
++    }
++  }
++  return { blocks, truncated };
++}
++
++function transcriptMessage(entry: ReturnType<ExtensionContext["sessionManager"]["buildContextEntries"]>[number]) {
++  // Context summaries can contain hidden thinking, so only export actual visible message entries.
++  if (entry.type === "custom_message") {
++    if (entry.display !== true) return null;
++    const normalized = transcriptBlocks(entry.content);
++    return {
++      id: entry.id, role: "custom", at: entry.timestamp,
++      ...(typeof entry.customType === "string" ? { label: entry.customType.slice(0, 120) } : {}),
++      content: normalized.blocks,
++      ...(normalized.truncated ? { truncated: true } : {}),
++    };
++  }
++  if (entry.type !== "message") return null;
++  const message = entry.message as Record<string, unknown>;
++  const role = message.role;
++  if (role === "system" || role === "thinking") return null;
++  if (role === "custom" && message.display !== true) return null;
++  if (!["user", "assistant", "toolResult", "bashExecution", "custom"].includes(String(role))) return null;
++
++  let content: unknown = message.content;
++  const toolName = typeof message.toolName === "string" ? message.toolName.slice(0, 120) : undefined;
++  const isError = typeof message.isError === "boolean" ? message.isError : undefined;
++  let command: string | undefined;
++  let exitCode: number | undefined;
++  let cancelled: boolean | undefined;
++  let bashTruncated: boolean | undefined;
++  if (role === "bashExecution") {
++    command = typeof message.command === "string" ? truncateUtf8(message.command, MAX_TRANSCRIPT_TOOL_ARGUMENT_BYTES).text : "";
++    content = [{ type: "text", text: typeof message.output === "string" ? message.output : "" }];
++    exitCode = typeof message.exitCode === "number" && Number.isFinite(message.exitCode) ? message.exitCode : undefined;
++    cancelled = typeof message.cancelled === "boolean" ? message.cancelled : undefined;
++    bashTruncated = typeof message.truncated === "boolean" ? message.truncated : undefined;
++  }
++  const normalized = transcriptBlocks(content);
++  const timestamp = typeof message.timestamp === "number" && Number.isFinite(message.timestamp) && Math.abs(message.timestamp) < 8.64e15
++    ? new Date(message.timestamp).toISOString()
++    : entry.timestamp;
++  const wasTruncated = normalized.truncated || bashTruncated === true;
++  return {
++    id: entry.id, role, at: timestamp,
++    ...(role === "custom" && typeof message.customType === "string" ? { label: message.customType.slice(0, 120) } : {}),
++    ...(toolName ? { toolName } : {}), ...(isError === undefined ? {} : { isError }),
++    ...(command === undefined ? {} : { command }),
++    ...(exitCode === undefined ? {} : { exitCode }),
++    ...(cancelled === undefined ? {} : { cancelled }),
++    content: normalized.blocks,
++    ...(role === "bashExecution" && bashTruncated !== undefined
++      ? { truncated: bashTruncated || normalized.truncated }
++      : wasTruncated ? { truncated: true } : {}),
++  };
++}
++
++export function readTranscript(ctx: ExtensionContext, afterEntryId: unknown) {
++  const entries = ctx.sessionManager.buildContextEntries();
++  const hasCursor = typeof afterEntryId === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(afterEntryId);
++  const cursorIndex = hasCursor ? entries.findIndex((entry) => entry.id === afterEntryId) : -1;
++  const reset = !hasCursor || cursorIndex < 0;
++  const messages: Record<string, unknown>[] = [];
++  let usedBytes = 0;
++  let truncated = false;
++  let more = false;
++  let cursor = reset ? entries.at(-1)?.id ?? null : afterEntryId;
++
++  if (reset) {
++    for (let index = entries.length - 1; index >= 0; index--) {
++      const message = transcriptMessage(entries[index]);
++      if (!message) continue;
++      if (messages.length >= MAX_TRANSCRIPT_MESSAGES) { truncated = true; break; }
++      const size = Buffer.byteLength(JSON.stringify(message), "utf8");
++      if (usedBytes + size > MAX_TRANSCRIPT_BYTES) { truncated = true; break; }
++      usedBytes += size;
++      messages.push(message);
++      if (message.truncated === true) truncated = true;
++    }
++    messages.reverse();
++  } else {
++    for (let index = cursorIndex + 1; index < entries.length; index++) {
++      const message = transcriptMessage(entries[index]);
++      if (message) {
++        const size = Buffer.byteLength(JSON.stringify(message), "utf8");
++        if (messages.length >= MAX_TRANSCRIPT_MESSAGES || usedBytes + size > MAX_TRANSCRIPT_BYTES) {
++          more = true;
++          break;
++        }
++        usedBytes += size;
++        messages.push(message);
++        if (message.truncated === true) truncated = true;
++      }
++      cursor = entries[index].id;
++    }
++  }
++  return { source: "pi-session", messages, cursor, reset, more, truncated };
++}
++
+ export default function bridgeExtension(pi: ExtensionAPI) {
+@@ -52,5 +234,5 @@ export default function bridgeExtension(pi: ExtensionAPI) {
+ 
+-  function send(frame: Record<string, unknown>) {
++  function send(frame: Record<string, unknown>, maxBytes = MAX_LINE_BYTES) {
+     const bytes = Buffer.from(JSON.stringify({ v: 1, ...frame }) + "\n");
+-    if (bytes.length > MAX_LINE_BYTES) return;
++    if (bytes.length > maxBytes) return;
+     if (ready && socket && !socket.destroyed) socket.write(bytes);
+@@ -90,2 +272,4 @@ export default function bridgeExtension(pi: ExtensionAPI) {
+         send({ op: "result", id, ok: true, data: readTaskState(currentContext) });
++      } else if (frame.command === "request_transcript" && currentContext) {
++        send({ op: "result", id, ok: true, data: readTranscript(currentContext, frame.afterEntryId) }, MAX_TRANSCRIPT_LINE_BYTES);
+       } else {
+diff --git a/src/bridge/protocol.mjs b/src/bridge/protocol.mjs
+index e4b8b21..b276181 100644
+--- a/src/bridge/protocol.mjs
++++ b/src/bridge/protocol.mjs
+@@ -4,7 +4,7 @@ import { join } from "node:path";
+ export const VERSION = 1;
+-export const MAX_LINE_BYTES = 64 * 1024;
++export const MAX_LINE_BYTES = 8 * 1024 * 1024;
+ export const COMMANDS = new Set([
+-  "send_instruction", "pause", "resume", "approve", "reject", "request_diff", "request_status", "request_task_state", "request_events",
++  "send_instruction", "pause", "resume", "approve", "reject", "request_diff", "request_status", "request_task_state", "request_events", "request_transcript",
+ ]);
+-export const FORWARDED_COMMANDS = new Set(["send_instruction", "request_diff", "request_task_state"]);
++export const FORWARDED_COMMANDS = new Set(["send_instruction", "request_diff", "request_task_state", "request_transcript"]);
+ 
+diff --git a/src/bridge/server.mjs b/src/bridge/server.mjs
+index 9e02852..d4898d0 100644
+--- a/src/bridge/server.mjs
++++ b/src/bridge/server.mjs
+@@ -134,3 +134,3 @@ function attach(socket) {
+       pending.set(id, { socket, clientId: frame.id, sessionId: frame.sessionId, timer });
+-      writeFrame(session.socket, { op: "command", id, command: frame.command, text: frame.text });
++      writeFrame(session.socket, { op: "command", id, command: frame.command, text: frame.text, afterEntryId: frame.afterEntryId });
+     })().catch((error) => {
+diff --git a/test/bridge-transcript.test.mjs b/test/bridge-transcript.test.mjs
+new file mode 100644
+index 0000000..c7a72eb
+--- /dev/null
++++ b/test/bridge-transcript.test.mjs
+@@ -0,0 +1,148 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { readTranscript } from "../extensions/bridge.ts";
++
++const timestamp = "2026-09-24T12:00:00.000Z";
++
++function context(entries, branch = entries) {
++  return { sessionManager: {
++    buildContextEntries: () => entries,
++    getBranch: () => branch,
++  } };
++}
++
++test("transcript exports visible messages, tool calls, outputs, and safe images without hidden prompts", () => {
++  const imageData = Buffer.alloc(96 * 1024).toString("base64");
++  const entries = [
++    { id: "system_1", timestamp, type: "message", message: { role: "system", content: "private system prompt", timestamp: Date.parse(timestamp) } },
++    { id: "user_1", timestamp, type: "message", message: { role: "user", content: [{ type: "text", text: "Inspect this screenshot" }, { type: "image", mimeType: "image/png", data: imageData }], timestamp: Date.parse(timestamp) } },
++    { id: "assistant_1", timestamp, type: "message", message: { role: "assistant", content: [{ type: "thinking", thinking: "private hidden reasoning" }, { type: "text", text: "I will inspect it." }, { type: "toolCall", id: "call_1", name: "bash", arguments: { command: "pwd" } }], timestamp: Date.parse(timestamp) } },
++    { id: "tool_1", timestamp, type: "message", message: { role: "toolResult", toolCallId: "call_1", toolName: "bash", content: [{ type: "text", text: "tool output" }], isError: false, timestamp: Date.parse(timestamp) } },
++    { id: "custom_hidden", timestamp, type: "message", message: { role: "custom", customType: "internal", display: false, content: "must not appear", timestamp: Date.parse(timestamp) } },
++    { id: "custom_message_hidden", timestamp, type: "custom_message", customType: "internal-hidden", display: false, content: "hidden Pi custom message", details: { secret: "not for export" } },
++    { id: "custom_message_visible", timestamp, type: "custom_message", customType: "notice", display: true, content: "visible custom message", details: { secret: "not for export" } },
++    { id: "bash_1", timestamp, type: "message", message: { role: "bashExecution", command: "git status", output: "working tree", exitCode: 0, cancelled: false, truncated: false, fullOutputPath: "/tmp/private/full-output.log", timestamp: Date.parse(timestamp) } },
++    { id: "compact_1", timestamp, type: "compaction", summary: "Compaction summary includes hidden thoughts", firstKeptEntryId: "user_1", tokensBefore: 100 },
++    { id: "branch_summary_1", timestamp, type: "branch_summary", summary: "Branch summary includes hidden reasoning", fromId: "user_1" },
++    { id: "state_1", timestamp, type: "custom", customType: "worklist-session-snapshot", data: {} },
++  ];
++
++  const result = readTranscript(context(entries), undefined);
++  const encoded = JSON.stringify(result);
++  assert.deepEqual(result.messages.map((message) => message.role), ["user", "assistant", "toolResult", "custom", "bashExecution"]);
++  assert.equal(result.cursor, "state_1");
++  assert.equal(result.reset, true);
++  assert.equal(encoded.includes("private system prompt"), false);
++  assert.equal(encoded.includes("private hidden reasoning"), false);
++  assert.equal(encoded.includes("must not appear"), false);
++  assert.equal(encoded.includes("hidden Pi custom message"), false);
++  assert.equal(encoded.includes("Compaction summary includes hidden thoughts"), false);
++  assert.equal(encoded.includes("Branch summary includes hidden reasoning"), false);
++  assert.equal(encoded.includes("/tmp/private/full-output.log"), false);
++  assert.equal(encoded.includes("not for export"), false);
++  assert.ok(Buffer.byteLength(encoded) > 64 * 1024, "image transcript exercises the enlarged frame limit");
++  assert.equal(result.messages[0].content[1].data, imageData);
++  assert.deepEqual(JSON.parse(result.messages[1].content.find((block) => block.type === "toolCall").arguments), { command: "pwd" });
++  assert.equal(result.messages[2].content[0].text, "tool output");
++  assert.equal(result.messages[3].label, "notice");
++  assert.equal(result.messages[3].content[0].text, "visible custom message");
++  assert.equal(result.messages[4].command, "git status");
++  assert.equal(result.messages[4].exitCode, 0);
++  assert.equal(result.messages[4].cancelled, false);
++  assert.equal(result.messages[4].truncated, false);
++});
++
++test("transcript deltas advance by active-branch entry and reset for stale cursors", () => {
++  const entries = [
++    { id: "user_1", timestamp, type: "message", message: { role: "user", content: "first", timestamp: Date.parse(timestamp) } },
++    { id: "state_1", timestamp, type: "custom", customType: "extension-state", data: {} },
++    { id: "assistant_1", timestamp, type: "message", message: { role: "assistant", content: [{ type: "text", text: "second" }], timestamp: Date.parse(timestamp) } },
++  ];
++  const delta = readTranscript(context(entries), "user_1");
++  assert.equal(delta.reset, false);
++  assert.equal(delta.cursor, "assistant_1");
++  assert.deepEqual(delta.messages.map((message) => message.id), ["assistant_1"]);
++
++  const reset = readTranscript(context(entries), "old_branch_entry");
++  assert.equal(reset.reset, true);
++  assert.deepEqual(reset.messages.map((message) => message.id), ["user_1", "assistant_1"]);
++});
++
++test("transcript uses compaction-aware context entries and excludes summaries", () => {
++  const contextEntries = [
++    { id: "compaction_1", timestamp, type: "compaction", summary: "summary may contain hidden reasoning", firstKeptEntryId: "kept_user", tokensBefore: 100 },
++    { id: "kept_user", timestamp, type: "message", message: { role: "user", content: "kept conversation", timestamp: Date.parse(timestamp) } },
++    { id: "branch_summary_1", timestamp, type: "branch_summary", summary: "branch summary may contain hidden reasoning", fromId: "kept_user" },
++    { id: "kept_assistant", timestamp, type: "message", message: { role: "assistant", content: "kept answer", timestamp: Date.parse(timestamp) } },
++  ];
++  const fullBranch = [
++    { id: "superseded_user", timestamp, type: "message", message: { role: "user", content: "superseded before compaction", timestamp: Date.parse(timestamp) } },
++    ...contextEntries,
++  ];
++  const sessionContext = context(contextEntries, fullBranch);
++  const result = readTranscript(sessionContext, undefined);
++  const encoded = JSON.stringify(result);
++  assert.deepEqual(result.messages.map((message) => message.id), ["kept_user", "kept_assistant"]);
++  assert.equal(encoded.includes("superseded before compaction"), false);
++  assert.equal(encoded.includes("summary may contain hidden reasoning"), false);
++  assert.equal(encoded.includes("branch summary may contain hidden reasoning"), false);
++
++  const delta = readTranscript(sessionContext, "kept_user");
++  assert.equal(delta.reset, false);
++  assert.equal(delta.cursor, "kept_assistant");
++  assert.deepEqual(delta.messages.map((message) => message.id), ["kept_assistant"]);
++  const staleCursor = readTranscript(sessionContext, "superseded_user");
++  assert.equal(staleCursor.reset, true);
++  assert.deepEqual(staleCursor.messages.map((message) => message.id), ["kept_user", "kept_assistant"]);
++});
++
++test("initial transcript snapshots bound the result and prefer the most recent entries", () => {
++  const entries = Array.from({ length: 85 }, (_, index) => ({
++    id: `msg_${index}`,
++    timestamp,
++    type: "message",
++    message: { role: index % 2 === 0 ? "user" : "assistant", content: `message ${index}`, timestamp: Date.parse(timestamp) + index },
++  }));
++  const result = readTranscript(context(entries), undefined);
++  assert.equal(result.messages.length, 80);
++  assert.equal(result.messages[0].id, "msg_5");
++  assert.equal(result.messages.at(-1).id, "msg_84");
++  assert.equal(result.truncated, true);
++  assert.equal(result.cursor, "msg_84");
++});
++
++test("a huge single delta entry is truncated and advances the active-context cursor", () => {
++  const toolCalls = Array.from({ length: 120 }, (_, index) => ({
++    type: "toolCall",
++    id: `call_${index}`,
++    name: "oversized-tool",
++    arguments: { value: "x".repeat(60 * 1024) },
++  }));
++  const entries = [
++    { id: "delta_start", timestamp, type: "message", message: { role: "user", content: "start", timestamp: Date.parse(timestamp) } },
++    { id: "huge_delta", timestamp, type: "message", message: { role: "assistant", content: toolCalls, timestamp: Date.parse(timestamp) } },
++  ];
++
++  const delta = readTranscript(context(entries), "delta_start");
++  assert.equal(delta.reset, false);
++  assert.equal(delta.cursor, "huge_delta");
++  assert.equal(delta.more, false);
++  assert.equal(delta.truncated, true);
++  assert.deepEqual(delta.messages.map((message) => message.id), ["huge_delta"]);
++  assert.ok(Buffer.byteLength(JSON.stringify(delta.messages[0]), "utf8") <= 3 * 1024 * 1024);
++});
++
++test("bash execution exports safe status fields but never its full output path", () => {
++  const entries = [
++    { id: "bash_failed", timestamp, type: "message", message: { role: "bashExecution", command: "false", output: "failed", exitCode: 7, cancelled: false, truncated: false, fullOutputPath: "/private/nonzero.log", timestamp: Date.parse(timestamp) } },
++    { id: "bash_cancelled", timestamp, type: "message", message: { role: "bashExecution", command: "sleep 10", output: "", exitCode: undefined, cancelled: true, truncated: false, fullOutputPath: "/private/cancelled.log", timestamp: Date.parse(timestamp) + 1 } },
++    { id: "bash_truncated", timestamp, type: "message", message: { role: "bashExecution", command: "large-output", output: "partial output", exitCode: 0, cancelled: false, truncated: true, fullOutputPath: "/private/truncated.log", timestamp: Date.parse(timestamp) + 2 } },
++  ];
++  const result = readTranscript(context(entries), undefined);
++  assert.deepEqual(result.messages.map(({ exitCode, cancelled, truncated }) => ({ exitCode, cancelled, truncated })), [
++    { exitCode: 7, cancelled: false, truncated: false },
++    { exitCode: undefined, cancelled: true, truncated: false },
++    { exitCode: 0, cancelled: false, truncated: true },
++  ]);
++  assert.equal(JSON.stringify(result).includes("/private/"), false);
++});
+diff --git a/test/bridge.test.mjs b/test/bridge.test.mjs
+index 8dbfbff..7549d6e 100644
+--- a/test/bridge.test.mjs
++++ b/test/bridge.test.mjs
+@@ -61,2 +61,13 @@ test("bridge registers a session, logs events, and forwards allowed commands", a
+     assert.equal((await instruction).data.accepted, true);
++    const transcript = protocol.request({ id: "transcript", command: "request_transcript", sessionId: "session_1", afterEntryId: "entry_1" });
++    await waitFor(() => frames.some((x) => x.op === "command" && x.command === "request_transcript"));
++    const transcriptCommand = frames.find((x) => x.op === "command" && x.command === "request_transcript");
++    assert.equal(transcriptCommand.afterEntryId, "entry_1");
++    const largeImage = "A".repeat(96 * 1024);
++    protocol.writeFrame(agent, { op: "result", id: transcriptCommand.id, ok: true, data: { source: "pi-session", messages: [{ id: "m1", role: "assistant", at: "2026-09-24T12:00:00Z", content: [{ type: "text", text: "private transcript text" }, { type: "image", mimeType: "image/png", data: largeImage }] }] } });
++    const transcriptResponse = await transcript;
++    assert.equal(transcriptResponse.data.messages[0].content[0].text, "private transcript text");
++    assert.equal(transcriptResponse.data.messages[0].content[1].data.length, largeImage.length);
++    const eventLog = await readFile(join(dir, "state", "session_1.jsonl"), "utf8");
++    assert.equal(eventLog.includes("private transcript text"), false);
+     const rejected = await protocol.request({ id: "reject", command: "approve", sessionId: "session_1" });

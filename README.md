@@ -2,7 +2,9 @@
 
 A small Go HTTP/SSE gateway and installable mobile-first PWA for the **already-running Pi sessions registered with pi-harness**. It does not start a second Pi runtime and does not expose the bridge Unix socket to the browser.
 
-The UI shows live session status, recent bridge events, read-only Stepstone task snapshots and `git diff --stat`. Its only write operation is `send_instruction`, which the existing bridge delivers to the selected Pi as a follow-up user message. There is no shell, approval, pause, or arbitrary command endpoint.
+The UI syncs the active, compaction-aware conversation by default, including user/assistant text, tool calls and arguments, tool outputs, bash commands and statuses, visible extension messages, and supported images. System prompts, hidden thinking, and compaction/branch summaries are excluded. Transcript frames are size-bounded and fetched incrementally; they are not written to bridge snapshots or event logs. The browser keeps at most 200 entries / 6 MiB in memory, does not cache API responses, and drops the oldest entries at that display limit. Use **会話を隠す** to stop sync, abort an in-flight request, and clear the displayed transcript.
+
+The only write operation is `send_instruction`, delivered to Pi as a follow-up user message. There is no shell, approval, pause, or arbitrary command endpoint.
 
 ## UI reference
 
@@ -10,12 +12,24 @@ The conversation layout follows patterns visible in the public Codex CLI/TUI sou
 
 The public repository describes `codex app` as the desktop experience, but its desktop UI implementation is not included in the open-source CLI repository. This implementation therefore references the published TUI source, not private desktop code.
 
-## Run locally
+## Enable transcript support in pi-harness
 
-Requirements: Go 1.24+ and the pi-harness bridge running with its Pi extension loaded into the sessions to control.
+The companion patch updates the pi-harness bridge protocol and extension to supply transcript snapshots. It targets pi-harness commit `ea1b2f32eda2fcba326717b2f2e9fb08b8be9ee7` and changes only the files included in [`integrations/pi-harness-transcript.patch`](integrations/pi-harness-transcript.patch).
 
 ```sh
-cd remote
+cd /path/to/pi-harness
+git apply /path/to/pi-field-console/integrations/pi-harness-transcript.patch
+npm run check
+npm test
+```
+
+Restart the pi-harness bridge daemon and Pi sessions after applying the patch. Older bridge versions continue to support status, events, and follow-up instructions, but not transcript sync.
+
+## Run locally
+
+Requirements: Go 1.24+ and the updated pi-harness bridge and Pi extension running.
+
+```sh
 go run .
 ```
 
@@ -33,7 +47,7 @@ Environment:
 
 ## Remote access boundary
 
-The gateway has **no user login of its own**, so keep it loopback-only. To use it from a phone, place it behind a trusted HTTPS/VPN reverse proxy (for example, a Tailscale Serve endpoint restricted by tailnet ACLs). Do not bind Go to a LAN/public address or forward port 8765 directly. If the proxy preserves the remote hostname, allow only that exact host and origin, e.g.:
+The gateway has **no user login of its own**, so keep it loopback-only. Conversation text, tool arguments and outputs, and images are sent to browsers admitted by the proxy; any admitted user can also send follow-up instructions. Use a trusted HTTPS/VPN reverse proxy with strict identity/ACL controls (for example, a Tailscale Serve endpoint restricted by tailnet ACLs). Do not bind Go to a LAN/public address or forward port 8765 directly. If the proxy preserves the remote hostname, allow only that exact host and origin, e.g.:
 
 ```sh
 PI_REMOTE_ALLOWED_HOSTS=pi-host.example-tailnet.ts.net \

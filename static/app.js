@@ -1,10 +1,14 @@
 const $ = (selector, root = document) => root.querySelector(selector);
 const state = {
   sessions: [], selectedId: null, connected: false,
-  events: new Map(), cursors: new Map(), sentMessages: new Map(),
+  events: new Map(), cursors: new Map(), sentMessages: new Map(), transcripts: new Map(), transcriptCursors: new Map(),
+  transcriptEnabled: true, transcriptLoadingFor: null, transcriptRequest: null,
   tasks: new Map(), diffs: new Map(), stream: null, toastTimer: null, refreshTimer: null,
   sessionSignature: "",
 };
+const MAX_TRANSCRIPT_MESSAGES = 200;
+const MAX_TRANSCRIPT_JSON_BYTES = 6 * 1024 * 1024;
+const transcriptEncoder = new TextEncoder();
 const sessionList = $("#session-list");
 const messageList = $("#message-list");
 const sidebar = $("#session-sidebar");
@@ -61,6 +65,33 @@ function formatCost(value) {
 }
 function taskStatusLabel(status) {
   return ({ todo: "未着手", doing: "進行中", done: "完了" })[status] || status;
+}
+function capTranscript(messages) {
+  const kept = [];
+  let jsonBytes = 2; // `[]`
+  let truncated = false;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (kept.length >= MAX_TRANSCRIPT_MESSAGES) {
+      truncated = true;
+      break;
+    }
+    let encoded;
+    try { encoded = JSON.stringify(messages[index]); } catch { encoded = null; }
+    if (typeof encoded !== "string") {
+      truncated = true;
+      break;
+    }
+    const itemBytes = transcriptEncoder.encode(encoded).byteLength;
+    const additionalBytes = itemBytes + (kept.length ? 1 : 0);
+    if (jsonBytes + additionalBytes > MAX_TRANSCRIPT_JSON_BYTES) {
+      truncated = true;
+      break;
+    }
+    jsonBytes += additionalBytes;
+    kept.push(messages[index]);
+  }
+  if (kept.length < messages.length) truncated = true;
+  return { messages: kept.reverse(), truncated };
 }
 
 async function api(url, options = {}) {
@@ -139,6 +170,7 @@ function updateHeader(session) {
     $("#send-button").disabled = true;
     $("#composer-hint").textContent = "Pi セッションを選ぶと指示を送れます。";
     $("#diff-button").disabled = true;
+    updateTranscriptControl();
     return;
   }
   name.textContent = text(session.name, shortPath(session.cwd));
@@ -159,6 +191,29 @@ function updateHeader(session) {
   $("#metric-tools").textContent = formatCount(telemetry.toolCalls);
   $("#metric-runs").textContent = formatCount(telemetry.runs);
   $("#metric-cost").textContent = formatCost(telemetry.mainModelCostUsd);
+  updateTranscriptControl();
+}
+
+function updateTranscriptControl() {
+  const button = $("#transcript-toggle");
+  const notice = $("#transcript-notice");
+  const session = state.sessions.find((item) => item.sessionId === state.selectedId);
+  const loading = state.transcriptLoadingFor === state.selectedId;
+  button.disabled = !session?.connected && !state.transcriptEnabled;
+  button.setAttribute("aria-pressed", String(state.transcriptEnabled));
+  button.textContent = state.transcriptEnabled ? "会話を隠す" : "会話を表示";
+  if (!session) {
+    notice.textContent = "会話本文・ツール情報・画像は既定で同期します。表示するセッションを選んでください。";
+  } else if (state.transcriptEnabled) {
+    const snapshot = state.transcripts.get(state.selectedId);
+    notice.textContent = snapshot?.truncated
+      ? "会話本文・ツール呼び出し／出力・画像を同期中です。一部を省略し、直近の内容を表示しています（ブラウザ／bridge の表示上限）。system prompt・thinking は除外し、本文はサーバーに保存しません。"
+      : loading
+        ? "会話本文・ツール呼び出し／出力・画像をこのブラウザへ同期中です。「会話を隠す」で取得を中止できます。system prompt・thinking は除外し、本文はサーバーに保存しません。"
+        : "会話本文・ツール呼び出し／出力・画像をこのブラウザへ同期中です。system prompt・thinking は除外し、会話本文はサーバーに保存しません。画面にアクセスできる人は会話を閲覧できます。";
+  } else {
+    notice.textContent = "会話本文の同期を停止中です。再開すると選択中の Pi から、本文・ツール呼び出し／出力・画像をこのブラウザへ取得します。";
+  }
 }
 
 function toggleDrawer(open) {
@@ -177,11 +232,12 @@ function showEmptyThread(hasSession) {
   avatar.setAttribute("aria-hidden", "true");
   avatar.textContent = "π";
   const heading = document.createElement("h2");
-  heading.textContent = hasSession ? "まだイベントはありません" : "Pi と作業を続ける";
+  const loading = state.transcriptLoadingFor === state.selectedId;
+  heading.textContent = loading ? "会話を読み込んでいます" : hasSession ? "まだ会話はありません" : "Pi と作業を続ける";
   const description = document.createElement("p");
   description.textContent = hasSession
-    ? "Pi が作業を始めると、ここに状況が表示されます。下の欄からフォローアップも送れます。"
-    : "セッションを選ぶと、作業イベントと送信した指示がここに並びます。";
+    ? loading ? "Pi から直近の会話を受信しています。" : "Pi が作業を始めると、ここに会話と作業イベントが表示されます。"
+    : "セッションを選ぶと、会話と作業イベントがここに並びます。";
   empty.append(avatar, heading, description);
   messageList.append(empty);
 }
@@ -231,9 +287,38 @@ function makePiMessage(item) {
   return row;
 }
 
-function makeUserMessage(item) {
+function appendTranscriptBlocks(container, blocks) {
+  const allowedImages = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+  for (const block of Array.isArray(blocks) ? blocks : []) {
+    if (block?.type === "text" && typeof block.text === "string") {
+      const content = document.createElement("p");
+      content.className = "bubble-text";
+      content.textContent = block.text;
+      container.append(content);
+    } else if (block?.type === "image" && allowedImages.has(block.mimeType) && typeof block.data === "string" && block.data.length <= 2 * 1024 * 1024) {
+      const image = document.createElement("img");
+      image.className = "message-image";
+      image.alt = "会話に添付された画像";
+      image.loading = "lazy";
+      image.decoding = "async";
+      image.src = `data:${block.mimeType};base64,${block.data}`;
+      container.append(image);
+    } else if (block?.type === "toolCall" && typeof block.name === "string") {
+      const disclosure = document.createElement("details");
+      disclosure.className = "tool-call-details";
+      const summary = document.createElement("summary");
+      summary.textContent = `ツール呼び出し · ${block.name}`;
+      const argumentsText = document.createElement("pre");
+      argumentsText.textContent = typeof block.arguments === "string" ? block.arguments : "{}";
+      disclosure.append(summary, argumentsText);
+      container.append(disclosure);
+    }
+  }
+}
+
+function makeUserMessage(item, senderLabel = "送信した指示") {
   const row = document.createElement("article");
-  row.className = "message-row user-message";
+  row.className = "message-row user-message transcript-message";
   const stack = document.createElement("div");
   stack.className = "message-stack";
   const meta = document.createElement("div");
@@ -242,16 +327,127 @@ function makeUserMessage(item) {
   time.textContent = formatTime(item.at);
   if (item.at) time.dateTime = item.at;
   const sender = document.createElement("strong");
-  sender.textContent = "送信した指示";
+  sender.textContent = senderLabel;
   meta.append(time, sender);
   const bubble = document.createElement("div");
   bubble.className = "message-bubble user-bubble";
-  const content = document.createElement("p");
-  content.className = "bubble-text";
-  content.textContent = item.text;
-  bubble.append(content);
+  if (Array.isArray(item.content)) appendTranscriptBlocks(bubble, item.content);
+  else {
+    const content = document.createElement("p");
+    content.className = "bubble-text";
+    content.textContent = item.text;
+    bubble.append(content);
+  }
   stack.append(meta, bubble);
   row.append(stack);
+  return row;
+}
+
+function makeAssistantMessage(item) {
+  const row = document.createElement("article");
+  row.className = "message-row pi-message transcript-message";
+  row.dataset.kind = "transcript";
+  const avatar = document.createElement("span");
+  avatar.className = "message-avatar";
+  avatar.setAttribute("aria-hidden", "true");
+  avatar.textContent = "π";
+  const stack = document.createElement("div");
+  stack.className = "message-stack";
+  const meta = document.createElement("div");
+  meta.className = "message-meta";
+  const sender = document.createElement("strong");
+  sender.textContent = "Pi";
+  const time = document.createElement("time");
+  time.textContent = formatTime(item.at);
+  if (item.at) time.dateTime = item.at;
+  meta.append(sender, time);
+  const bubble = document.createElement("div");
+  bubble.className = "message-bubble pi-bubble";
+  appendTranscriptBlocks(bubble, item.content);
+  stack.append(meta, bubble);
+  row.append(avatar, stack);
+  return row;
+}
+
+function bashExecutionStatus(item) {
+  const exitCode = Number.isSafeInteger(item.exitCode) ? item.exitCode : null;
+  const cancelled = typeof item.cancelled === "boolean" ? item.cancelled : typeof item.canceled === "boolean" ? item.canceled : null;
+  const truncated = typeof item.truncated === "boolean" ? item.truncated : typeof item.outputTruncated === "boolean" ? item.outputTruncated : null;
+  const labels = [];
+  if (exitCode !== null) labels.push(`終了コード ${exitCode}`);
+  if (cancelled !== null) labels.push(cancelled ? "キャンセルされました" : "キャンセルなし");
+  if (truncated !== null) labels.push(truncated ? "出力の一部を省略しました" : "出力の省略なし");
+  return { labels, warning: cancelled === true || (exitCode !== null && exitCode !== 0) };
+}
+
+function makeToolMessage(item) {
+  const row = document.createElement("article");
+  const bashStatus = item.role === "bashExecution" ? bashExecutionStatus(item) : null;
+  const warning = item.isError === true || bashStatus?.warning;
+  row.className = `message-row pi-message tool-message${warning ? " is-warning" : ""}`;
+  row.dataset.kind = item.role;
+  const avatar = document.createElement("span");
+  avatar.className = "message-avatar tool-avatar";
+  avatar.setAttribute("aria-hidden", "true");
+  avatar.textContent = "⚙";
+  const stack = document.createElement("div");
+  stack.className = "message-stack";
+  const meta = document.createElement("div");
+  meta.className = "message-meta";
+  const sender = document.createElement("strong");
+  sender.textContent = item.role === "toolResult" ? `ツール出力 · ${text(item.toolName, "tool")}` : item.role === "bashExecution" ? "bash 実行" : `Pi extension · ${text(item.label, "custom")}`;
+  const time = document.createElement("time");
+  time.textContent = formatTime(item.at);
+  if (item.at) time.dateTime = item.at;
+  meta.append(sender, time);
+  const bubble = document.createElement("div");
+  bubble.className = "message-bubble pi-bubble tool-bubble";
+  if (item.command) {
+    const command = document.createElement("details");
+    command.className = "tool-call-details";
+    const summary = document.createElement("summary");
+    summary.textContent = "実行コマンド";
+    const value = document.createElement("pre");
+    value.textContent = item.command;
+    command.append(summary, value);
+    bubble.append(command);
+  }
+  if (bashStatus?.labels.length) {
+    const status = document.createElement("p");
+    status.className = "tool-status";
+    status.textContent = bashStatus.labels.join(" · ");
+    bubble.append(status);
+  }
+  // Render only known scalar status fields above; in particular, never expose fullOutputPath.
+  appendTranscriptBlocks(bubble, item.content);
+  stack.append(meta, bubble);
+  row.append(avatar, stack);
+  return row;
+}
+
+function makeSummaryMessage(item) {
+  const row = document.createElement("article");
+  row.className = "message-row pi-message transcript-message";
+  row.dataset.kind = "summary";
+  const avatar = document.createElement("span");
+  avatar.className = "message-avatar";
+  avatar.setAttribute("aria-hidden", "true");
+  avatar.textContent = "π";
+  const stack = document.createElement("div");
+  stack.className = "message-stack";
+  const meta = document.createElement("div");
+  meta.className = "message-meta";
+  const sender = document.createElement("strong");
+  sender.textContent = text(item.label, "会話の要約");
+  const time = document.createElement("time");
+  time.textContent = formatTime(item.at);
+  if (item.at) time.dateTime = item.at;
+  meta.append(sender, time);
+  const bubble = document.createElement("div");
+  bubble.className = "message-bubble pi-bubble summary-bubble";
+  appendTranscriptBlocks(bubble, item.content);
+  stack.append(meta, bubble);
+  row.append(avatar, stack);
   return row;
 }
 
@@ -260,9 +456,12 @@ function renderMessages(scrollToBottom = false) {
   messageList.replaceChildren();
   const session = state.sessions.find((item) => item.sessionId === state.selectedId);
   const events = state.events.get(state.selectedId) || [];
-  const sent = state.sentMessages.get(state.selectedId) || [];
+  const transcript = state.transcriptEnabled ? state.transcripts.get(state.selectedId)?.messages || [] : [];
+  const transcriptUserTexts = new Set(transcript.filter((item) => item.role === "user").map((item) => (item.content || []).filter((block) => block.type === "text").map((block) => block.text).join("")));
+  const sent = (state.sentMessages.get(state.selectedId) || []).filter((item) => !transcriptUserTexts.has(item.text));
   const messages = [
-    ...events.map((item) => ({ ...item, messageRole: "pi", sortTime: Date.parse(item.at) || 0 })),
+    ...events.map((item) => ({ ...item, messageRole: "event", sortTime: Date.parse(item.at) || 0 })),
+    ...transcript.map((item) => ({ ...item, messageRole: item.role, senderLabel: item.role === "user" ? "あなた" : "Pi", sortTime: Date.parse(item.at) || 0 })),
     ...sent.map((item) => ({ ...item, messageRole: "user", sortTime: Date.parse(item.at) || 0 })),
   ].sort((a, b) => a.sortTime - b.sortTime);
 
@@ -271,7 +470,11 @@ function renderMessages(scrollToBottom = false) {
     return;
   }
   for (const item of messages) {
-    messageList.append(item.messageRole === "user" ? makeUserMessage(item) : makePiMessage(item));
+    if (item.messageRole === "user") messageList.append(makeUserMessage(item, item.senderLabel));
+    else if (item.messageRole === "assistant") messageList.append(makeAssistantMessage(item));
+    else if (item.messageRole === "toolResult" || item.messageRole === "bashExecution" || item.messageRole === "custom") messageList.append(makeToolMessage(item));
+    else if (item.messageRole === "summary") messageList.append(makeSummaryMessage(item));
+    else messageList.append(makePiMessage(item));
   }
   if (scrollToBottom || wasNearBottom) messageList.scrollTop = messageList.scrollHeight;
 }
@@ -325,12 +528,23 @@ function renderDiff() {
   output.textContent = result.summary || "差分はありません。";
 }
 
+function cancelTranscriptRequest() {
+  const request = state.transcriptRequest;
+  state.transcriptRequest = null;
+  state.transcriptLoadingFor = null;
+  request?.controller.abort();
+}
+
 async function selectSession(sessionId) {
   if (state.selectedId === sessionId) {
     toggleDrawer(false);
     return;
   }
+  cancelTranscriptRequest();
+  state.transcripts.clear();
+  state.transcriptCursors.clear();
   state.selectedId = sessionId;
+  updateTranscriptControl();
   toggleDrawer(false);
   renderSessionList();
   updateHeader(state.sessions.find((item) => item.sessionId === sessionId));
@@ -384,6 +598,82 @@ async function refreshDetails(reset = false) {
   } catch (error) {
     if (reset && state.selectedId === sessionId) showToast(error.message, "error");
   }
+  if (state.transcriptEnabled && state.selectedId === sessionId) void refreshTranscript(reset);
+}
+
+async function refreshTranscript(notifyError = false) {
+  const sessionId = state.selectedId;
+  const session = state.sessions.find((item) => item.sessionId === sessionId);
+  if (!state.transcriptEnabled || !session?.connected || !sessionId || state.transcriptRequest) return;
+  const request = { sessionId, controller: new AbortController() };
+  state.transcriptRequest = request;
+  state.transcriptLoadingFor = sessionId;
+  updateTranscriptControl();
+  let continuePaging = false;
+  const isCurrentRequest = () => state.transcriptRequest === request && state.selectedId === sessionId && state.transcriptEnabled;
+  try {
+    const cursor = state.transcriptCursors.get(sessionId);
+    const query = cursor ? `?afterEntryId=${encodeURIComponent(cursor)}` : "";
+    const transcript = await api(`/api/sessions/${encodeURIComponent(sessionId)}/transcript${query}`, { signal: request.controller.signal });
+    if (!isCurrentRequest()) return;
+    if (!Array.isArray(transcript.messages)) throw new Error("Pi から会話データを読み取れませんでした。");
+
+    const replace = transcript.reset === true || !state.transcripts.has(sessionId);
+    const previousSnapshot = state.transcripts.get(sessionId);
+    const previous = replace ? [] : previousSnapshot?.messages || [];
+    const messages = new Map(previous.map((item) => [item.id, item]));
+    for (const item of transcript.messages) messages.set(item.id, item);
+    const sorted = [...messages.values()].sort((a, b) => (Date.parse(a.at) || 0) - (Date.parse(b.at) || 0));
+    const capped = capTranscript(sorted);
+    state.transcripts.set(sessionId, {
+      ...transcript,
+      messages: capped.messages,
+      truncated: transcript.truncated === true || (!replace && previousSnapshot?.truncated === true) || capped.truncated,
+    });
+    if (typeof transcript.cursor === "string") state.transcriptCursors.set(sessionId, transcript.cursor);
+    else if (replace) state.transcriptCursors.delete(sessionId);
+    if (replace || transcript.messages.length > 0) renderMessages();
+    continuePaging = transcript.more === true;
+    updateTranscriptControl();
+  } catch (error) {
+    if (request.controller.signal.aborted || !isCurrentRequest()) return;
+    if (notifyError) {
+      state.transcriptEnabled = false;
+      state.transcripts.delete(sessionId);
+      state.transcriptCursors.delete(sessionId);
+      renderMessages();
+      const unsupported = /unknown command|unsupported command|not implemented/i.test(error.message);
+      showToast(unsupported ? "会話表示には pi-harness bridge の更新が必要です。" : error.message, "error");
+    }
+  } finally {
+    if (state.transcriptRequest === request) {
+      state.transcriptRequest = null;
+      state.transcriptLoadingFor = null;
+      updateTranscriptControl();
+    }
+    if (continuePaging && state.selectedId === sessionId && state.transcriptEnabled) setTimeout(() => void refreshTranscript(), 0);
+  }
+}
+
+async function toggleTranscript() {
+  const sessionId = state.selectedId;
+  if (!sessionId) {
+    state.transcriptEnabled = !state.transcriptEnabled;
+    updateTranscriptControl();
+    return;
+  }
+  if (state.transcriptEnabled) {
+    state.transcriptEnabled = false;
+    cancelTranscriptRequest();
+    state.transcripts.delete(sessionId);
+    state.transcriptCursors.delete(sessionId);
+    renderMessages();
+    updateTranscriptControl();
+    return;
+  }
+  state.transcriptEnabled = true;
+  updateTranscriptControl();
+  await refreshTranscript(true);
 }
 
 async function loadDiff() {
@@ -421,10 +711,11 @@ async function sendInstruction(event) {
     });
     const sent = state.sentMessages.get(session.sessionId) || [];
     sent.push({ id: `local-${Date.now()}`, at: new Date().toISOString(), text: value });
-    state.sentMessages.set(session.sessionId, sent);
+    state.sentMessages.set(session.sessionId, sent.slice(-100));
     composer.value = "";
     composer.style.height = "auto";
-    renderMessages(true);
+    if (state.transcriptEnabled) void refreshTranscript();
+    else renderMessages(true);
     showToast(result.accepted ? "Pi に指示を送りました。" : "Pi が指示を受け付けました。");
   } catch (error) {
     showToast(error.message, "error");
@@ -453,6 +744,10 @@ function applySnapshot(payload) {
   const selected = state.sessions.find((session) => session.sessionId === state.selectedId);
   updateHeader(selected);
   if (previousSelection !== state.selectedId) {
+    cancelTranscriptRequest();
+    state.transcripts.clear();
+    state.transcriptCursors.clear();
+    updateTranscriptControl();
     renderMessages(true);
     if (state.selectedId) void refreshDetails(true);
   }
@@ -488,6 +783,7 @@ sessionInfo.addEventListener("click", (event) => {
   if (event.target === sessionInfo) sessionInfo.close();
 });
 $("#diff-button").addEventListener("click", loadDiff);
+$("#transcript-toggle").addEventListener("click", toggleTranscript);
 $("#instruction-form").addEventListener("submit", sendInstruction);
 composer.addEventListener("input", () => {
   composer.style.height = "auto";

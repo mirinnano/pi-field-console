@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -14,11 +15,12 @@ import (
 )
 
 type fakeCall struct {
-	Command   string `json:"command"`
-	SessionID string `json:"sessionId"`
-	Text      string `json:"text"`
-	After     int64  `json:"after"`
-	ID        string `json:"id"`
+	Command      string `json:"command"`
+	SessionID    string `json:"sessionId"`
+	Text         string `json:"text"`
+	After        int64  `json:"after"`
+	AfterEntryID string `json:"afterEntryId"`
+	ID           string `json:"id"`
 }
 
 func startFakeBridge(t *testing.T) (string, <-chan fakeCall) {
@@ -50,19 +52,19 @@ func startFakeBridge(t *testing.T) (string, <-chan fakeCall) {
 				}
 				var request fakeCall
 				var frame struct {
-					V       int             `json:"v"`
-					Op      string          `json:"op"`
-					ID      string          `json:"id"`
-					Command string          `json:"command"`
-					Session string          `json:"sessionId"`
-					Text    string          `json:"text"`
-					After   int64           `json:"after"`
-					Fields  json.RawMessage `json:"fields"`
+					V            int    `json:"v"`
+					Op           string `json:"op"`
+					ID           string `json:"id"`
+					Command      string `json:"command"`
+					Session      string `json:"sessionId"`
+					Text         string `json:"text"`
+					After        int64  `json:"after"`
+					AfterEntryID string `json:"afterEntryId"`
 				}
 				if json.Unmarshal(line, &frame) != nil || frame.V != bridgeVersion || frame.Op != "request" {
 					return
 				}
-				request = fakeCall{Command: frame.Command, SessionID: frame.Session, Text: frame.Text, After: frame.After, ID: frame.ID}
+				request = fakeCall{Command: frame.Command, SessionID: frame.Session, Text: frame.Text, After: frame.After, AfterEntryID: frame.AfterEntryID, ID: frame.ID}
 				select {
 				case calls <- request:
 				default:
@@ -73,6 +75,8 @@ func startFakeBridge(t *testing.T) (string, <-chan fakeCall) {
 					data = []map[string]any{{"sessionId": "sess_1", "cwd": "/tmp/demo", "connected": true, "status": "working"}}
 				case "request_events":
 					data = map[string]any{"events": []map[string]any{{"seq": 4, "at": "2026-09-24T12:00:00Z", "type": "ToolStarted", "summary": "read"}}, "cursor": 4, "dropped": false}
+				case "request_transcript":
+					data = map[string]any{"source": "pi-session", "cursor": "m1", "reset": true, "more": false, "truncated": false, "messages": []map[string]any{{"id": "m1", "role": "assistant", "at": "2026-09-24T12:00:00Z", "content": []map[string]any{{"type": "text", "text": "Unit-test transcript"}, {"type": "image", "mimeType": "image/png", "data": strings.Repeat("A", 96*1024)}}}}}
 				case "request_task_state":
 					data = map[string]any{"source": "stepstone", "snapshotFound": true, "total": 1, "tasks": []map[string]any{{"id": "task_1", "title": "Inspect the change", "status": "doing"}}}
 				case "request_diff":
@@ -131,6 +135,58 @@ func TestAPIUsesOnlyScopedBridgeCommands(t *testing.T) {
 	}
 	if call := <-calls; call.Command != "request_events" || call.SessionID != "sess_1" || call.After != 3 {
 		t.Fatalf("unexpected events bridge call: %+v", call)
+	}
+
+	response, err = http.Get(server.URL + "/api/sessions/sess_1/transcript")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var transcript map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&transcript); err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	messages, ok := transcript["messages"].([]any)
+	if response.StatusCode != http.StatusOK || !ok || len(messages) != 1 || response.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("unexpected transcript response: status=%d body=%v headers=%v", response.StatusCode, transcript, response.Header)
+	}
+	message, messageOK := messages[0].(map[string]any)
+	content, contentOK := message["content"].([]any)
+	if !messageOK || !contentOK || len(content) < 2 {
+		t.Fatalf("unexpected transcript message: %#v", messages[0])
+	}
+	image, imageOK := content[1].(map[string]any)
+	imageData, dataOK := image["data"].(string)
+	if !imageOK || !dataOK || len(imageData) != 96*1024 {
+		t.Fatalf("large transcript image was not preserved: %#v", content[1])
+	}
+	if call := <-calls; call.Command != "request_transcript" || call.SessionID != "sess_1" || call.AfterEntryID != "" {
+		t.Fatalf("unexpected initial transcript bridge call: %+v", call)
+	}
+
+	response, err = http.Get(server.URL + "/api/sessions/sess_1/transcript?afterEntryId=entry_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("incremental transcript request returned %d", response.StatusCode)
+	}
+	if call := <-calls; call.Command != "request_transcript" || call.SessionID != "sess_1" || call.AfterEntryID != "entry_1" {
+		t.Fatalf("unexpected incremental transcript bridge call: %+v", call)
+	}
+	response, err = http.Get(server.URL + "/api/sessions/sess_1/transcript?afterEntryId=../bad")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid transcript cursor was not rejected: %d", response.StatusCode)
+	}
+	select {
+	case call := <-calls:
+		t.Fatalf("invalid transcript cursor reached bridge: %+v", call)
+	default:
 	}
 
 	response, err = http.Get(server.URL + "/api/sessions/sess_1/tasks")
@@ -204,6 +260,67 @@ func TestAPIUsesOnlyScopedBridgeCommands(t *testing.T) {
 	_ = response.Body.Close()
 	if response.StatusCode < 400 {
 		t.Fatalf("reserved pause command unexpectedly exposed: %d", response.StatusCode)
+	}
+}
+
+func TestBridgeRequestClosesSocketWhenCallerCancels(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "ph-cancel-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socketPath := dir + "/b.sock"
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	requestSeen := make(chan struct{})
+	readError := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			readError <- err
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		if _, err := reader.ReadBytes('\n'); err != nil {
+			readError <- err
+			return
+		}
+		close(requestSeen)
+		_, err = reader.ReadByte()
+		readError <- err
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	requestDone := make(chan error, 1)
+	go func() {
+		_, err := newService(socketPath).bridgeRequest(ctx, "request_transcript", "sess_1", nil)
+		requestDone <- err
+	}()
+	select {
+	case <-requestSeen:
+	case <-time.After(time.Second):
+		t.Fatal("bridge did not receive the request")
+	}
+	cancel()
+	select {
+	case err := <-readError:
+		if err == nil {
+			t.Fatal("bridge socket remained open after caller cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("caller cancellation did not close the bridge socket")
+	}
+	select {
+	case err := <-requestDone:
+		if err == nil {
+			t.Fatal("cancelled bridge request unexpectedly succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled bridge request did not return")
 	}
 }
 

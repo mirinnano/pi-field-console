@@ -24,9 +24,10 @@ import (
 )
 
 const (
-	bridgeVersion  = 1
-	maxBridgeLine  = 64 * 1024
-	maxInstruction = 8000
+	bridgeVersion           = 1
+	maxBridgeLine           = 64 * 1024
+	maxTranscriptBridgeLine = 8 * 1024 * 1024
+	maxInstruction          = 8000
 )
 
 var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
@@ -59,6 +60,7 @@ func (s *service) handler(cfg config, assets fs.FS) http.Handler {
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/sessions", s.handleSessions)
 	mux.HandleFunc("GET /api/sessions/{sessionID}/events", s.handleEvents)
+	mux.HandleFunc("GET /api/sessions/{sessionID}/transcript", s.handleTranscript)
 	mux.HandleFunc("GET /api/sessions/{sessionID}/tasks", s.handleTasks)
 	mux.HandleFunc("GET /api/sessions/{sessionID}/diff", s.handleDiff)
 	mux.HandleFunc("POST /api/sessions/{sessionID}/instruction", s.handleInstruction)
@@ -179,6 +181,18 @@ func (s *service) handleEvents(w http.ResponseWriter, r *http.Request) {
 	writeRawJSON(w, http.StatusOK, data)
 }
 
+func (s *service) handleTranscript(w http.ResponseWriter, r *http.Request) {
+	fields := map[string]any{}
+	if afterEntryID := r.URL.Query().Get("afterEntryId"); afterEntryID != "" {
+		if !validSessionID(afterEntryID) {
+			writeError(w, http.StatusBadRequest, "invalid transcript cursor")
+			return
+		}
+		fields["afterEntryId"] = afterEntryID
+	}
+	s.handleSessionCommand(w, r, "request_transcript", fields)
+}
+
 func (s *service) handleTasks(w http.ResponseWriter, r *http.Request) {
 	s.handleSessionCommand(w, r, "request_task_state", nil)
 }
@@ -237,7 +251,7 @@ func (s *service) handleInstruction(w http.ResponseWriter, r *http.Request) {
 func (s *service) bridgeRequest(ctx context.Context, command, sessionID string, fields map[string]any) (json.RawMessage, error) {
 	allowed := map[string]bool{
 		"request_status": true, "request_events": true, "request_task_state": true,
-		"request_diff": true, "send_instruction": true,
+		"request_transcript": true, "request_diff": true, "send_instruction": true,
 	}
 	if !allowed[command] {
 		return nil, errors.New("command not allowed")
@@ -269,6 +283,8 @@ func (s *service) bridgeRequest(ctx context.Context, command, sessionID string, 
 		return nil, fmt.Errorf("bridge unavailable: %w", err)
 	}
 	defer conn.Close()
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
 	deadline := time.Now().Add(12 * time.Second)
 	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
 		deadline = ctxDeadline
@@ -277,12 +293,16 @@ func (s *service) bridgeRequest(ctx context.Context, command, sessionID string, 
 	if _, err := conn.Write(append(encoded, '\n')); err != nil {
 		return nil, fmt.Errorf("bridge unavailable: %w", err)
 	}
-	reader := bufio.NewReaderSize(conn, maxBridgeLine)
+	responseLimit := maxBridgeLine
+	if command == "request_transcript" {
+		responseLimit = maxTranscriptBridgeLine
+	}
+	reader := bufio.NewReaderSize(conn, responseLimit)
 	line, err := reader.ReadSlice('\n')
 	if err != nil {
 		return nil, fmt.Errorf("bridge unavailable: %w", err)
 	}
-	if len(line) > maxBridgeLine {
+	if len(line) > responseLimit {
 		return nil, errors.New("bridge response too large")
 	}
 	var reply bridgeReply
@@ -320,6 +340,8 @@ func writeBridgeError(w http.ResponseWriter, err error) {
 			status = http.StatusConflict
 		} else if upstream.message == "invalid instruction" {
 			status = http.StatusBadRequest
+		} else if upstream.message == "unknown command" || upstream.message == "unsupported command" || upstream.message == "not implemented in this milestone" {
+			status = http.StatusNotImplemented
 		}
 		writeError(w, status, upstream.message)
 		return

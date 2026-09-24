@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#0c1411">
+  <meta name="theme-color" content="#171918">
   <meta name="description" content="Pi の実行状況を確認し、フォローアップを送るためのチャット画面です。">
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
@@ -56,7 +56,8 @@
       <main class="chat-view">
         <div class="thread-notice" role="note">
           <span class="notice-icon" aria-hidden="true">i</span>
-          <p>会話本文やツール出力は bridge から取得できません。ここには作業イベントの要約と、この画面から送った指示を表示します。</p>
+          <p id="transcript-notice">会話本文・ツール呼び出し／出力・画像は既定でこのブラウザへ同期されます。system prompt・thinking は含まず、会話本文をサーバーには保存しません。</p>
+          <button id="transcript-toggle" class="text-button" type="button" aria-controls="message-list" aria-pressed="true" disabled>会話を隠す</button>
         </div>
         <section id="message-list" class="message-list" role="log" aria-label="セッションの会話と作業イベント" aria-relevant="additions">
           <div id="chat-empty" class="chat-empty">

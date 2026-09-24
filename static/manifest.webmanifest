@@ -1,7 +1,7 @@
 {
   "name": "Pi リモートチャット",
   "short_name": "Pi チャット",
-  "description": "Pi の作業イベントを確認し、フォローアップを送信します。",
+  "description": "Pi の会話本文・ツール出力・画像を表示し、フォローアップを送信します。",
   "lang": "ja",
   "start_url": "/",
   "display": "standalone",
