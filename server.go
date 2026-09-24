@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -39,8 +40,12 @@ type config struct {
 }
 
 type service struct {
-	bridgePath string
-	hub        *liveHub
+	bridgePath    string
+	hub           *liveHub
+	herdr         *herdrClient
+	history       *sessionHistory
+	historyRoots  []string
+	historyRootMu sync.Mutex
 }
 
 type bridgeReply struct {
@@ -53,13 +58,61 @@ type bridgeReply struct {
 }
 
 func newService(bridgePath string) *service {
-	return &service{bridgePath: bridgePath, hub: newLiveHub()}
+	roots := sessionHistoryRoots()
+	history := &sessionHistory{roots: append([]string(nil), roots...), metadataCache: make(map[string]cachedHistoryMetadata)}
+	return &service{
+		bridgePath: bridgePath, hub: newLiveHub(), herdr: newHerdrClient(),
+		history: history, historyRoots: roots,
+	}
+}
+
+func sessionHistoryRoots() []string {
+	home, err := os.UserHomeDir()
+	if err != nil || !filepath.IsAbs(home) {
+		return nil
+	}
+	agentDir := strings.TrimSpace(os.Getenv("PI_CODING_AGENT_DIR"))
+	if !filepath.IsAbs(agentDir) {
+		agentDir = filepath.Join(home, ".pi", "agent")
+	}
+	roots := make([]string, 0, 8)
+	seen := make(map[string]struct{})
+	add := func(value string) {
+		if !filepath.IsAbs(value) || len(value) > 4096 {
+			return
+		}
+		root := filepath.Clean(value)
+		if _, exists := seen[root]; exists {
+			return
+		}
+		seen[root] = struct{}{}
+		roots = append(roots, root)
+	}
+	add(filepath.Join(agentDir, "sessions"))
+	add(os.Getenv("PI_CODING_AGENT_SESSION_DIR"))
+	settingsPath := filepath.Join(agentDir, "settings.json")
+	if info, statErr := os.Stat(settingsPath); statErr == nil && info.Mode().IsRegular() && info.Size() <= 1<<20 {
+		if data, readErr := os.ReadFile(settingsPath); readErr == nil {
+			var settings struct {
+				SessionDir string `json:"sessionDir"`
+			}
+			if json.Unmarshal(data, &settings) == nil {
+				add(settings.SessionDir)
+			}
+		}
+	}
+	for _, value := range strings.Split(os.Getenv("PI_REMOTE_SESSION_DIRS"), ",") {
+		add(strings.TrimSpace(value))
+	}
+	return roots
 }
 
 func (s *service) handler(cfg config, assets fs.FS) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/sessions", s.handleSessions)
+	mux.HandleFunc("GET /api/history", s.handleHistory)
+	mux.HandleFunc("GET /api/history/{sessionID}/transcript", s.handleHistoryTranscript)
 	mux.HandleFunc("GET /api/sessions/{sessionID}/events", s.handleEvents)
 	mux.HandleFunc("GET /api/sessions/{sessionID}/transcript", s.handleTranscript)
 	mux.HandleFunc("GET /api/sessions/{sessionID}/tasks", s.handleTasks)
@@ -68,6 +121,10 @@ func (s *service) handler(cfg config, assets fs.FS) http.Handler {
 	mux.HandleFunc("GET /api/sessions/{sessionID}/codex-usage", s.handleCodexUsage)
 	mux.HandleFunc("POST /api/sessions/{sessionID}/model", s.handleModel)
 	mux.HandleFunc("POST /api/sessions/{sessionID}/instruction", s.handleInstruction)
+	mux.HandleFunc("GET /api/herdr", s.handleHerdr)
+	mux.HandleFunc("GET /api/herdr/panes/{paneID}/output", s.handleHerdrPaneOutput)
+	mux.HandleFunc("POST /api/herdr/panes/{paneID}/focus", s.handleHerdrPaneFocus)
+	mux.HandleFunc("POST /api/herdr/panes/{paneID}/instruction", s.handleHerdrPaneInstruction)
 	mux.HandleFunc("GET /api/live", s.handleLive)
 
 	static, err := fs.Sub(assets, "static")
@@ -159,7 +216,340 @@ func (s *service) handleSessions(w http.ResponseWriter, r *http.Request) {
 		writeBridgeError(w, err)
 		return
 	}
-	writeRawJSON(w, http.StatusOK, data)
+	public, _, err := projectSessions(data)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "invalid bridge response")
+		return
+	}
+	writeRawJSON(w, http.StatusOK, public)
+}
+
+func projectSessions(data []byte) (json.RawMessage, map[string]string, error) {
+	var sessions []map[string]json.RawMessage
+	if err := json.Unmarshal(data, &sessions); err != nil {
+		return nil, nil, err
+	}
+	public := make([]map[string]json.RawMessage, 0, len(sessions))
+	links := make(map[string]string)
+	allowed := map[string]bool{
+		"sessionId": true, "cwd": true, "name": true, "connected": true, "status": true, "eventSeq": true,
+		"updatedAt": true, "startedAt": true, "currentModel": true, "telemetry": true,
+	}
+	for _, session := range sessions {
+		item := make(map[string]json.RawMessage)
+		for key, value := range session {
+			if allowed[key] {
+				item[key] = value
+			}
+		}
+		var sessionID, sessionFile string
+		_ = json.Unmarshal(session["sessionId"], &sessionID)
+		_ = json.Unmarshal(session["sessionFile"], &sessionFile)
+		if validSessionID(sessionID) {
+			if normalized := normalizeSessionPath(sessionFile); normalized != "" {
+				links[normalized] = sessionID
+			}
+		}
+		public = append(public, item)
+	}
+	encoded, err := json.Marshal(public)
+	if err != nil {
+		return nil, nil, err
+	}
+	return encoded, links, nil
+}
+
+type historySessionView struct {
+	SessionID string `json:"sessionId"`
+	CWD       string `json:"cwd"`
+	Name      string `json:"name,omitempty"`
+	CreatedAt string `json:"createdAt"`
+	UpdatedAt string `json:"updatedAt"`
+	Connected bool   `json:"connected"`
+	Status    string `json:"status"`
+}
+
+type historyFolderView struct {
+	Path     string               `json:"path"`
+	Sessions []historySessionView `json:"sessions"`
+}
+
+func (s *service) handleHistory(w http.ResponseWriter, r *http.Request) {
+	if s.history == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"folders": []historyFolderView{}})
+		return
+	}
+	var liveByID map[string]json.RawMessage
+	if data, err := s.bridgeRequest(r.Context(), "request_status", "", nil); err == nil {
+		s.addRegisteredHistoryRoots(data)
+		var live []map[string]json.RawMessage
+		if json.Unmarshal(data, &live) == nil {
+			liveByID = make(map[string]json.RawMessage, len(live))
+			for _, item := range live {
+				var id string
+				_ = json.Unmarshal(item["sessionId"], &id)
+				if validSessionID(id) {
+					encoded, _ := json.Marshal(item)
+					liveByID[id] = encoded
+				}
+			}
+		}
+	}
+	folders := make([]historyFolderView, 0)
+	folderIndex := make(map[string]int)
+	for _, item := range s.history.List() {
+		path := item.CWD
+		index, ok := folderIndex[path]
+		if !ok {
+			index = len(folders)
+			folderIndex[path] = index
+			folders = append(folders, historyFolderView{Path: path, Sessions: []historySessionView{}})
+		}
+		row := historySessionView{SessionID: item.SessionID, CWD: item.CWD, Name: item.Name, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt, Status: "offline"}
+		if encoded, exists := liveByID[item.SessionID]; exists {
+			var live struct {
+				Connected bool   `json:"connected"`
+				Status    string `json:"status"`
+				Name      string `json:"name"`
+				UpdatedAt string `json:"updatedAt"`
+			}
+			if json.Unmarshal(encoded, &live) == nil {
+				row.Connected = live.Connected
+				if live.Connected && live.Status != "" {
+					row.Status = live.Status
+				}
+				if live.Name != "" {
+					row.Name = live.Name
+				}
+				if live.UpdatedAt != "" {
+					row.UpdatedAt = live.UpdatedAt
+				}
+			}
+		}
+		folders[index].Sessions = append(folders[index].Sessions, row)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"folders": folders})
+}
+
+func (s *service) handleHistoryTranscript(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("sessionID")
+	if !validSessionID(id) {
+		writeError(w, http.StatusBadRequest, "invalid session id")
+		return
+	}
+	if s.history == nil {
+		writeError(w, http.StatusServiceUnavailable, "session history unavailable")
+		return
+	}
+	s.history.List()
+	transcript, err := s.history.Transcript(id)
+	if err != nil {
+		if err.Error() == "session not found" {
+			writeError(w, http.StatusNotFound, "session not found")
+		} else {
+			writeError(w, http.StatusConflict, "session unavailable")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, transcript)
+}
+
+func (s *service) addRegisteredHistoryRoots(data []byte) {
+	var sessions []struct {
+		SessionFile string `json:"sessionFile"`
+		SessionDir  string `json:"sessionDir"`
+	}
+	if json.Unmarshal(data, &sessions) != nil {
+		return
+	}
+	roots := make([]string, 0, len(sessions)*2)
+	for _, session := range sessions {
+		if root := normalizeSessionPath(session.SessionDir); root != "" {
+			roots = append(roots, root)
+		} else if file := normalizeSessionPath(session.SessionFile); file != "" {
+			roots = append(roots, file)
+		}
+	}
+	s.addHistoryRoots(roots)
+}
+
+func (s *service) addHistoryRoots(extra []string) {
+	if s.history == nil || len(extra) == 0 {
+		return
+	}
+	s.historyRootMu.Lock()
+	defer s.historyRootMu.Unlock()
+	known := make(map[string]struct{}, len(s.historyRoots))
+	for _, root := range s.historyRoots {
+		known[root] = struct{}{}
+	}
+	changed := false
+	for _, value := range extra {
+		root := normalizeSessionPath(value)
+		if root == "" {
+			continue
+		}
+		if _, exists := known[root]; exists {
+			continue
+		}
+		if len(s.historyRoots) >= historyMaxRoots {
+			break
+		}
+		s.historyRoots = append(s.historyRoots, root)
+		known[root] = struct{}{}
+		changed = true
+	}
+	if changed {
+		s.history.SetRoots(s.historyRoots)
+	}
+}
+
+func (s *service) handleHerdr(w http.ResponseWriter, r *http.Request) {
+	if s.herdr == nil || !s.herdr.available() {
+		writeJSON(w, http.StatusOK, emptyHerdrOverview())
+		return
+	}
+	raw, err := s.herdr.snapshot(r.Context())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "Herdr unavailable")
+		return
+	}
+	links := map[string]string{}
+	extraRoots := make([]string, 0, len(raw.Panes))
+	if data, bridgeErr := s.bridgeRequest(r.Context(), "request_status", "", nil); bridgeErr == nil {
+		s.addRegisteredHistoryRoots(data)
+		_, links, _ = projectSessions(data)
+	}
+	for _, pane := range raw.Panes {
+		if pane.AgentSession != nil {
+			if sessionFile := normalizeSessionPath(pane.AgentSession.Value); sessionFile != "" {
+				extraRoots = append(extraRoots, sessionFile)
+			}
+		}
+	}
+	s.addHistoryRoots(extraRoots)
+	if s.history != nil {
+		for sessionFile, sessionID := range s.history.SessionFiles() {
+			links[sessionFile] = sessionID
+		}
+	}
+	writeJSON(w, http.StatusOK, projectHerdrSnapshot(raw, links, s.herdr.ownPaneID))
+}
+
+func (s *service) handleHerdrPaneOutput(w http.ResponseWriter, r *http.Request) {
+	paneID := r.PathValue("paneID")
+	if !herdrIDPattern.MatchString(paneID) {
+		writeError(w, http.StatusBadRequest, "invalid pane id")
+		return
+	}
+	if s.herdr == nil || !s.herdr.available() {
+		writeError(w, http.StatusServiceUnavailable, "Herdr unavailable")
+		return
+	}
+	output, err := s.herdr.readPane(r.Context(), paneID)
+	if err != nil {
+		writeHerdrError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"paneId": paneID, "text": output})
+}
+
+func (s *service) handleHerdrPaneFocus(w http.ResponseWriter, r *http.Request) {
+	paneID := r.PathValue("paneID")
+	if !herdrIDPattern.MatchString(paneID) {
+		writeError(w, http.StatusBadRequest, "invalid pane id")
+		return
+	}
+	if s.herdr == nil || !s.herdr.available() {
+		writeError(w, http.StatusServiceUnavailable, "Herdr unavailable")
+		return
+	}
+	snapshot, err := s.herdr.snapshot(r.Context())
+	if err == nil {
+		err = s.herdr.focusAgent(r.Context(), snapshot, paneID)
+	}
+	if err != nil {
+		writeHerdrError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
+}
+
+func (s *service) handleHerdrPaneInstruction(w http.ResponseWriter, r *http.Request) {
+	paneID := r.PathValue("paneID")
+	if !herdrIDPattern.MatchString(paneID) {
+		writeError(w, http.StatusBadRequest, "invalid pane id")
+		return
+	}
+	if s.herdr == nil || !s.herdr.available() {
+		writeError(w, http.StatusServiceUnavailable, "Herdr unavailable")
+		return
+	}
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var input struct {
+		Text string `json:"text"`
+	}
+	if err := decoder.Decode(&input); err != nil || strings.TrimSpace(input.Text) == "" || len(input.Text) > maxInstruction {
+		writeError(w, http.StatusBadRequest, "invalid instruction")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid instruction")
+		return
+	}
+	snapshot, err := s.herdr.snapshot(r.Context())
+	if err == nil {
+		err = s.herdr.promptAgent(r.Context(), snapshot, paneID, input.Text)
+	}
+	if err != nil {
+		writeHerdrError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
+}
+
+func (s *service) sessionFiles(ctx context.Context) map[string]string {
+	data, err := s.bridgeRequest(ctx, "request_status", "", nil)
+	if err != nil {
+		return map[string]string{}
+	}
+	_, links, err := projectSessions(data)
+	if err != nil {
+		return map[string]string{}
+	}
+	return links
+}
+
+func emptyHerdrOverview() herdrOverview {
+	return herdrOverview{Available: false, Workspaces: []herdrWorkspace{}, Tabs: []herdrTab{}, Panes: []herdrPane{}}
+}
+
+func writeHerdrError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errHerdrInstructionOutcomeUnknown) {
+		writeJSON(w, http.StatusBadGateway, map[string]string{
+			"error": "Herdr instruction outcome unknown; verify before retrying.",
+			"code":  "herdr_instruction_uncertain",
+		})
+		return
+	}
+	status := http.StatusBadGateway
+	message := "Herdr request failed"
+	switch err.Error() {
+	case "Herdr unavailable":
+		status, message = http.StatusServiceUnavailable, "Herdr unavailable"
+	case "Herdr request timed out":
+		status, message = http.StatusGatewayTimeout, "Herdr request timed out"
+	case "invalid pane id":
+		status, message = http.StatusBadRequest, "invalid pane id"
+	case "pane unavailable", "agent unavailable", "agent blocked; resolve it in Herdr first", "cannot target current Pi pane":
+		status, message = http.StatusConflict, err.Error()
+	case "instruction must be 1–8000 bytes":
+		status, message = http.StatusBadRequest, err.Error()
+	}
+	writeError(w, status, message)
 }
 
 func (s *service) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -600,12 +990,12 @@ func (s *service) pollBridgeWhileActive(ctx context.Context, interval time.Durat
 			s.hub.publish(false, json.RawMessage("[]"))
 			return
 		}
-		var sessions []json.RawMessage
-		if json.Unmarshal(data, &sessions) != nil {
+		public, _, err := projectSessions(data)
+		if err != nil {
 			s.hub.publish(false, json.RawMessage("[]"))
 			return
 		}
-		s.hub.publish(true, data)
+		s.hub.publish(true, public)
 	}
 
 	ticker := time.NewTicker(interval)

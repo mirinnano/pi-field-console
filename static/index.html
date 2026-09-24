@@ -34,15 +34,55 @@
 
     <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
     <div class="main-layout">
-      <aside id="session-sidebar" class="session-sidebar" aria-label="セッション一覧">
+      <aside id="session-sidebar" class="session-sidebar" aria-label="コンソール一覧">
         <div class="sidebar-heading">
-          <h1>セッション <span id="session-count" class="session-count">0</span></h1>
+          <h1><span id="sidebar-label">セッション</span> <span id="session-count" class="session-count">0</span></h1>
           <button id="refresh-button" class="header-icon refresh-button" type="button" aria-label="更新" title="更新">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4.7 16.7A8 8 0 0 0 18.8 18M4 17v-5h5M19.3 7.3A8 8 0 0 0 5.2 6"/></svg>
           </button>
         </div>
-        <div id="session-list" class="session-list"></div>
-        <div id="empty-sessions" class="empty-sessions" hidden>セッションなし</div>
+        <nav id="sidebar-mode-switch" class="sidebar-mode-switch" aria-label="表示">
+          <button id="sidebar-mode-live" class="sidebar-mode-button" type="button" data-sidebar-mode="live" aria-controls="session-mode-panel" aria-pressed="true">稼働</button>
+          <button id="sidebar-mode-folders" class="sidebar-mode-button" type="button" data-sidebar-mode="folders" aria-controls="folder-history-panel" aria-pressed="false">履歴</button>
+          <button id="sidebar-mode-herdr" class="sidebar-mode-button" type="button" data-sidebar-mode="herdr" aria-controls="herdr-sidebar-panel" aria-pressed="false">Herdr</button>
+        </nav>
+        <section id="session-mode-panel" class="sidebar-mode-panel" aria-label="稼働セッション">
+          <div id="session-list" class="session-list"></div>
+          <div id="empty-sessions" class="empty-sessions" hidden>セッションなし</div>
+        </section>
+        <section id="folder-history-panel" class="sidebar-mode-panel folder-history-panel" aria-label="フォルダ履歴" hidden>
+          <div class="sidebar-panel-heading"><h2>フォルダ履歴</h2></div>
+          <div id="folder-history-list" class="folder-history-list" role="list" aria-label="フォルダ履歴"></div>
+          <div id="folder-history-empty" class="sidebar-empty">履歴なし</div>
+        </section>
+        <section id="herdr-sidebar-panel" class="sidebar-mode-panel herdr-sidebar-panel" aria-label="Herdr" hidden>
+          <div class="sidebar-panel-heading">
+            <h2>Herdr</h2>
+          </div>
+          <div id="herdr-workspace-list" class="herdr-workspace-list" role="list" aria-label="ワークスペース"></div>
+          <div id="herdr-empty-state" class="sidebar-empty">ワークスペースなし</div>
+          <div id="herdr-hierarchy" class="herdr-hierarchy">
+            <section class="herdr-level" aria-labelledby="herdr-tabs-title">
+              <div class="herdr-level-heading">
+                <h3 id="herdr-tabs-title">タブ</h3>
+              </div>
+              <div id="herdr-tab-list" class="herdr-level-list" role="tablist" aria-labelledby="herdr-tabs-title" aria-orientation="vertical"></div>
+              <div id="herdr-tab-empty" class="sidebar-empty">タブなし</div>
+            </section>
+            <section class="herdr-level" aria-labelledby="herdr-panes-title">
+              <div class="herdr-level-heading">
+                <h3 id="herdr-panes-title">ペイン</h3>
+              </div>
+              <div id="herdr-pane-list" class="herdr-level-list" role="list" aria-labelledby="herdr-panes-title"></div>
+              <div id="herdr-pane-empty" class="sidebar-empty">ペインなし</div>
+            </section>
+          </div>
+          <details id="herdr-swarm-overview" class="herdr-swarm-overview">
+            <summary>Swarm <span id="herdr-agent-count" class="section-count">0</span></summary>
+            <div id="herdr-agent-list" class="herdr-agent-list" role="list" aria-label="エージェント"></div>
+            <div id="herdr-agent-empty" class="sidebar-empty">エージェントなし</div>
+          </details>
+        </section>
       </aside>
 
       <main class="chat-view">
@@ -132,6 +172,36 @@
       </button>
     </div>
     <p>会話・ツール出力・画像をブラウザに同期します。system prompt と thinking は除外。アクセスできる人には表示されます。</p>
+  </dialog>
+
+  <dialog id="herdr-pane-dialog" class="herdr-dialog" aria-labelledby="herdr-pane-title">
+    <div class="dialog-heading">
+      <div class="herdr-dialog-heading">
+        <h2 id="herdr-pane-title">Pane</h2>
+        <div id="herdr-pane-breadcrumb" class="herdr-pane-breadcrumb" role="group" aria-label="ワークスペース、タブ、ペイン">
+          <span id="herdr-dialog-workspace">—</span><span aria-hidden="true"> / </span><span id="herdr-dialog-tab">—</span><span aria-hidden="true"> / </span><span id="herdr-dialog-pane">—</span>
+        </div>
+      </div>
+      <button id="close-herdr-pane" class="header-icon" type="button" aria-label="閉じる">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+      </button>
+    </div>
+    <div class="herdr-pane-state"><span id="herdr-pane-agent">—</span><span id="herdr-pane-status">待機</span></div>
+    <pre id="herdr-pane-output" class="herdr-pane-output" role="region" aria-label="Pane 出力" aria-live="polite" tabindex="0" data-max-output-chars="12000">出力なし</pre>
+    <div class="herdr-pane-controls">
+      <button id="herdr-pane-focus-button" class="text-button" type="button">フォーカス</button>
+      <span id="herdr-pane-focus-state" class="herdr-pane-focus-state" aria-live="polite">未選択</span>
+      <button id="herdr-linked-session-button" class="text-button" type="button" hidden>Pi セッション</button>
+    </div>
+    <form id="herdr-pane-action-form" class="herdr-pane-action-form">
+      <label class="sr-only" for="herdr-pane-action-text">指示</label>
+      <div class="herdr-pane-action-box">
+        <textarea id="herdr-pane-action-text" rows="2" maxlength="2000" placeholder="Pane へ指示"></textarea>
+        <button id="herdr-pane-send-button" class="send-button" type="submit" aria-label="Pane に送信" title="Pane に送信" disabled>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"/></svg>
+        </button>
+      </div>
+    </form>
   </dialog>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>

@@ -115,7 +115,11 @@ func startFakeBridge(t *testing.T) (string, <-chan fakeCall) {
 
 func testHandler(t *testing.T, socketPath string) http.Handler {
 	t.Helper()
-	return newService(socketPath).handler(config{allowedHosts: map[string]struct{}{}, allowedOrigin: map[string]struct{}{}}, webAssets)
+	app := newService(socketPath)
+	app.history = newSessionHistory(nil)
+	app.historyRoots = nil
+	app.herdr = &herdrClient{binary: "", enabled: false}
+	return app.handler(config{allowedHosts: map[string]struct{}{}, allowedOrigin: map[string]struct{}{}}, webAssets)
 }
 
 func TestAPIUsesOnlyScopedBridgeCommands(t *testing.T) {

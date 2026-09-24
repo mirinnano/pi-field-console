@@ -7,6 +7,9 @@ const state = {
   tasks: new Map(), diffs: new Map(), models: new Map(), codexUsage: new Map(), loadingCodexUsage: new Set(), loadingModels: new Set(), modelSwitching: false,
   stream: null, liveConnected: false, toastTimer: null, detailRefreshAgain: new Set(),
   sessionSignature: "",
+  sidebarMode: "live", historyFolders: [], historyLoaded: false,
+  herdr: null, herdrLoaded: false, selectedHerdrWorkspaceId: null, selectedHerdrTabId: null, selectedHerdrPaneId: null,
+  historySelection: null, herdrPaneRequest: null,
 };
 const MAX_TRANSCRIPT_MESSAGES = 200;
 const MAX_TRANSCRIPT_JSON_BYTES = 6 * 1024 * 1024;
@@ -17,6 +20,7 @@ const sidebar = $("#session-sidebar");
 const backdrop = $("#drawer-backdrop");
 const composer = $("#instruction-text");
 const sessionInfo = $("#session-info");
+const sidebarLabel = $("#sidebar-label");
 
 const eventTitles = {
   SessionStarted: "接続",
@@ -108,7 +112,11 @@ async function api(url, options = {}) {
     cache: "no-store",
   });
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error || `リクエストに失敗しました（${response.status}）`);
+  if (!response.ok) {
+    const error = new Error(payload.error || `リクエストに失敗しました（${response.status}）`);
+    error.code = typeof payload.code === "string" ? payload.code : "";
+    throw error;
+  }
   return payload;
 }
 
@@ -132,11 +140,12 @@ function setConnection(connected) {
 }
 
 function renderSessionList() {
-  $("#session-count").textContent = String(state.sessions.length);
+  const liveSessions = state.sessions.filter((session) => session.historyOnly !== true);
+  $("#session-count").textContent = String(liveSessions.length);
   sessionList.replaceChildren();
-  $("#empty-sessions").hidden = state.sessions.length !== 0;
+  $("#empty-sessions").hidden = liveSessions.length !== 0;
 
-  for (const session of state.sessions) {
+  for (const session of liveSessions) {
     const status = statusFor(session);
     const button = document.createElement("button");
     button.type = "button";
@@ -281,7 +290,7 @@ function updateHeader(session) {
 function updateTranscriptControl() {
   const button = $("#transcript-toggle");
   const session = state.sessions.find((item) => item.sessionId === state.selectedId);
-  button.disabled = !session?.connected && !state.transcriptEnabled;
+  button.disabled = !session?.connected && !session?.historyOnly;
   button.setAttribute("aria-pressed", String(state.transcriptEnabled));
   button.textContent = state.transcriptEnabled ? "隠す" : "表示";
   button.title = state.transcriptEnabled ? "会話を隠す" : "会話を表示";
@@ -661,6 +670,8 @@ async function selectSession(sessionId) {
   cancelTranscriptRequest();
   state.transcripts.clear();
   state.transcriptCursors.clear();
+  state.historySelection = null;
+  state.sessions = state.sessions.filter((item) => item.historyOnly !== true);
   state.selectedId = sessionId;
   composer.value = state.drafts.get(sessionId) || "";
   resizeComposer();
@@ -671,6 +682,78 @@ async function selectSession(sessionId) {
   renderMessages(true);
   restoreSessionScroll(sessionId);
   await Promise.all([refreshDetails(true), loadModels(sessionId)]);
+}
+
+async function selectHistorySession(historySession) {
+  if (state.sessions.some((item) => item.sessionId === historySession.sessionId && item.historyOnly !== true && item.connected)) {
+    setSidebarMode("live");
+    await selectSession(historySession.sessionId);
+    return;
+  }
+  const sessionId = historySession.sessionId;
+  if (state.selectedId) {
+    state.drafts.set(state.selectedId, composer.value);
+    state.scrollPositions.set(state.selectedId, messageList.scrollTop);
+  }
+  cancelDetailRefresh(state.selectedId);
+  cancelTranscriptRequest();
+  state.transcripts.clear();
+  state.transcriptCursors.clear();
+  state.historySelection = {
+    ...historySession, connected: false, status: "offline", historyOnly: true,
+  };
+  state.sessions = state.sessions.filter((item) => item.historyOnly !== true);
+  state.sessions.push(state.historySelection);
+  state.selectedId = sessionId;
+  state.events.delete(sessionId);
+  state.cursors.delete(sessionId);
+  state.tasks.delete(sessionId);
+  state.diffs.delete(sessionId);
+  composer.value = "";
+  resizeComposer();
+  updateTranscriptControl();
+  toggleDrawer(false);
+  setSidebarMode("folders");
+  renderSessionList();
+  updateHeader(state.historySelection);
+  renderMessages(true);
+  await loadHistoryTranscript(sessionId);
+}
+
+function resumeSelectedHistoryTranscript() {
+  const sessionId = state.selectedId;
+  if (!sessionId || state.historySelection?.sessionId !== sessionId || !state.transcriptEnabled
+    || state.transcripts.has(sessionId) || state.transcriptRequest) return;
+  void loadHistoryTranscript(sessionId);
+}
+
+async function loadHistoryTranscript(sessionId) {
+  if (!state.transcriptEnabled || state.selectedId !== sessionId || state.transcripts.has(sessionId) || state.transcriptRequest) return;
+  const request = { sessionId, controller: new AbortController() };
+  state.transcriptRequest = request;
+  state.transcriptLoadingFor = sessionId;
+  updateTranscriptControl();
+  try {
+    const transcript = await api(`/api/history/${encodeURIComponent(sessionId)}/transcript`, { signal: request.controller.signal });
+    if (state.transcriptRequest !== request || state.selectedId !== sessionId || !state.transcriptEnabled) return;
+    const messages = Array.isArray(transcript.messages) ? transcript.messages : [];
+    const capped = capTranscript(messages);
+    state.transcripts.set(sessionId, {
+      ...transcript,
+      messages: capped.messages,
+      truncated: transcript.truncated === true || capped.truncated,
+    });
+    if (typeof transcript.cursor === "string") state.transcriptCursors.set(sessionId, transcript.cursor);
+    renderMessages(true);
+  } catch (error) {
+    if (!request.controller.signal.aborted && state.selectedId === sessionId) showToast(error.message, "error");
+  } finally {
+    if (state.transcriptRequest === request) {
+      state.transcriptRequest = null;
+      state.transcriptLoadingFor = null;
+      updateTranscriptControl();
+    }
+  }
 }
 
 async function loadModels(sessionId) {
@@ -823,6 +906,22 @@ async function refreshTranscript(notifyError = false) {
 
 async function toggleTranscript() {
   const sessionId = state.selectedId;
+  const session = state.sessions.find((item) => item.sessionId === sessionId);
+  if (session?.historyOnly) {
+    if (state.transcriptEnabled) {
+      state.transcriptEnabled = false;
+      cancelTranscriptRequest();
+      state.transcripts.delete(sessionId);
+      state.transcriptCursors.delete(sessionId);
+      renderMessages();
+      updateTranscriptControl();
+      return;
+    }
+    state.transcriptEnabled = true;
+    updateTranscriptControl();
+    await loadHistoryTranscript(sessionId);
+    return;
+  }
   if (!sessionId) {
     state.transcriptEnabled = !state.transcriptEnabled;
     updateTranscriptControl();
@@ -974,7 +1073,14 @@ async function sendInstruction(event) {
 function applySnapshot(payload) {
   const previousSelection = state.selectedId;
   const previousSession = state.sessions.find((item) => item.sessionId === previousSelection);
-  const nextSessions = Array.isArray(payload.sessions) ? payload.sessions : [];
+  const liveSessions = Array.isArray(payload.sessions) ? payload.sessions : [];
+  const archive = state.historySelection?.sessionId === previousSelection ? state.historySelection : null;
+  const archiveReplacedByLive = archive && liveSessions.some((session) => session.sessionId === archive.sessionId && session.connected === true);
+  const keepArchive = archive && !archiveReplacedByLive;
+  const nextSessions = keepArchive
+    ? [...liveSessions.filter((session) => session.sessionId !== archive.sessionId), archive]
+    : liveSessions;
+  if (archiveReplacedByLive) state.historySelection = null;
   setConnection(payload.connected === true);
   if (payload.connected !== true && nextSessions.length === 0 && state.sessions.length > 0) {
     for (const session of state.sessions) session.connected = false;
@@ -985,7 +1091,7 @@ function applySnapshot(payload) {
   }
   const signature = JSON.stringify(nextSessions);
   const nextSelection = !state.selectedId || !nextSessions.some((session) => session.sessionId === state.selectedId)
-    ? nextSessions[0]?.sessionId || null : state.selectedId;
+    ? liveSessions[0]?.sessionId || null : state.selectedId;
   if (previousSelection && previousSelection !== nextSelection) {
     state.drafts.set(previousSelection, composer.value);
     state.scrollPositions.set(previousSelection, messageList.scrollTop);
@@ -1012,6 +1118,9 @@ function applySnapshot(payload) {
       void refreshDetails(true);
       void loadModels(state.selectedId);
     }
+  } else if (selected?.connected && previousSession?.historyOnly) {
+    void refreshDetails(true);
+    void loadModels(selected.sessionId);
   } else if (selected?.connected && previousSession && Number.isSafeInteger(selected.eventSeq) && selected.eventSeq !== previousSession.eventSeq) {
     void refreshDetails(false);
   }
@@ -1029,6 +1138,7 @@ function stopActiveConnection() {
 
 function startActiveConnection() {
   if (document.visibilityState === "hidden") return;
+  resumeSelectedHistoryTranscript();
   if (!state.stream) {
     const stream = new EventSource("/api/live");
     state.stream = stream;
@@ -1061,12 +1171,334 @@ async function refreshSessions() {
   }
 }
 
+function setSidebarMode(mode) {
+  if (!["live", "folders", "herdr"].includes(mode)) return;
+  state.sidebarMode = mode;
+  const config = {
+    live: ["#sidebar-mode-live", "#session-mode-panel", "セッション"],
+    folders: ["#sidebar-mode-folders", "#folder-history-panel", "履歴"],
+    herdr: ["#sidebar-mode-herdr", "#herdr-sidebar-panel", "Herdr"],
+  };
+  for (const [name, [buttonSelector, panelSelector]] of Object.entries(config)) {
+    $(buttonSelector).setAttribute("aria-pressed", String(name === mode));
+    $(panelSelector).hidden = name !== mode;
+  }
+  sidebarLabel.textContent = config[mode][2];
+  $("#session-count").hidden = mode !== "live";
+  if (mode === "folders" && !state.historyLoaded) void loadHistory();
+  if (mode === "herdr" && !state.herdrLoaded) void loadHerdr();
+}
+
+function renderFolderHistory() {
+  const list = $("#folder-history-list");
+  list.replaceChildren();
+  const folders = Array.isArray(state.historyFolders) ? state.historyFolders : [];
+  const total = folders.reduce((sum, folder) => sum + (Array.isArray(folder.sessions) ? folder.sessions.length : 0), 0);
+  $("#folder-history-empty").hidden = total > 0;
+  for (const folder of folders) {
+    if (typeof folder?.path !== "string") continue;
+    const group = document.createElement("section");
+    group.className = "folder-history-group";
+    const heading = document.createElement("div");
+    heading.className = "folder-history-heading";
+    const name = document.createElement("strong");
+    name.textContent = shortPath(folder.path);
+    name.title = folder.path;
+    const path = document.createElement("span");
+    path.className = "folder-history-path";
+    path.textContent = folder.path;
+    heading.append(name, path);
+    group.append(heading);
+    for (const session of Array.isArray(folder.sessions) ? folder.sessions : []) {
+      if (typeof session?.sessionId !== "string") continue;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "folder-history-item";
+      button.title = folder.path;
+      button.setAttribute("aria-current", String(session.sessionId === state.selectedId));
+      const title = document.createElement("span");
+      title.textContent = text(session.name, formatTime(session.updatedAt) || session.sessionId);
+      const status = document.createElement("small");
+      status.textContent = session.connected ? statusLabel(statusFor(session)) : "履歴";
+      button.append(title, status);
+      button.addEventListener("click", () => void selectHistorySession({ ...session, cwd: folder.path }));
+      group.append(button);
+    }
+    list.append(group);
+  }
+}
+
+async function loadHistory() {
+  try {
+    const result = await api("/api/history");
+    state.historyFolders = Array.isArray(result.folders) ? result.folders : [];
+    state.historyLoaded = true;
+    renderFolderHistory();
+    resumeSelectedHistoryTranscript();
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+function herdrLabel(value, fallback = "—") {
+  return typeof value === "string" && value.trim() ? value : fallback;
+}
+
+function herdrItemButton(className, primary, secondary = "") {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = className;
+  const label = document.createElement("span");
+  label.textContent = primary;
+  button.append(label);
+  if (secondary) {
+    const detail = document.createElement("small");
+    detail.textContent = secondary;
+    button.append(detail);
+  }
+  return button;
+}
+
+function renderHerdr() {
+  const snapshot = state.herdr;
+  const workspacesNode = $("#herdr-workspace-list");
+  const tabsNode = $("#herdr-tab-list");
+  const panesNode = $("#herdr-pane-list");
+  const agentsNode = $("#herdr-agent-list");
+  for (const node of [workspacesNode, tabsNode, panesNode, agentsNode]) node.replaceChildren();
+  const workspaces = Array.isArray(snapshot?.workspaces) ? snapshot.workspaces : [];
+  const tabs = Array.isArray(snapshot?.tabs) ? snapshot.tabs : [];
+  const panes = Array.isArray(snapshot?.panes) ? snapshot.panes : [];
+  const agents = panes.filter((pane) => pane.canAct === true && typeof pane.agent === "string" && pane.agent);
+  $("#herdr-agent-count").textContent = String(agents.length);
+  $("#herdr-agent-empty").hidden = agents.length > 0;
+  $("#herdr-empty-state").hidden = workspaces.length > 0;
+  $("#herdr-empty-state").textContent = snapshot?.available ? "ワークスペースなし" : "Herdr 未接続";
+  $("#herdr-hierarchy").hidden = workspaces.length === 0;
+  $("#herdr-swarm-overview").hidden = workspaces.length === 0;
+  if (!workspaces.length) {
+    $("#herdr-tab-empty").hidden = false;
+    $("#herdr-pane-empty").hidden = false;
+    return;
+  }
+
+  let workspace = workspaces.find((item) => item.id === state.selectedHerdrWorkspaceId);
+  if (!workspace) workspace = workspaces.find((item) => item.focused) || workspaces[0];
+  state.selectedHerdrWorkspaceId = workspace.id;
+  for (const item of workspaces) {
+    const title = herdrLabel(item.repoName, herdrLabel(item.label, `Workspace ${item.number || ""}`));
+    const button = herdrItemButton("herdr-workspace-item", title, herdrLabel(item.checkoutPath, item.agentStatus));
+    button.title = herdrLabel(item.checkoutPath, item.label || title);
+    button.setAttribute("aria-current", String(item.id === workspace.id));
+    button.addEventListener("click", () => {
+      state.selectedHerdrWorkspaceId = item.id;
+      state.selectedHerdrTabId = null;
+      state.selectedHerdrPaneId = null;
+      renderHerdr();
+    });
+    workspacesNode.append(button);
+  }
+
+  const workspaceTabs = tabs.filter((item) => item.workspaceId === workspace.id);
+  $("#herdr-tabs-title").textContent = `タブ · ${workspaceTabs.length}`;
+  $("#herdr-tab-empty").hidden = workspaceTabs.length > 0;
+  if (!workspaceTabs.length) {
+    $("#herdr-pane-empty").hidden = false;
+  }
+  let tab = workspaceTabs.find((item) => item.id === state.selectedHerdrTabId);
+  if (!tab) tab = workspaceTabs.find((item) => item.focused) || workspaceTabs.find((item) => item.id === workspace.activeTabId) || workspaceTabs[0];
+  state.selectedHerdrTabId = tab?.id || null;
+  for (const item of workspaceTabs) {
+    const button = herdrItemButton("herdr-tab-item", item.label || `Tab ${item.number}`, item.agentStatus);
+    button.setAttribute("role", "tab");
+    button.setAttribute("aria-selected", String(item.id === tab?.id));
+    button.addEventListener("click", () => {
+      state.selectedHerdrTabId = item.id;
+      state.selectedHerdrPaneId = null;
+      renderHerdr();
+    });
+    tabsNode.append(button);
+  }
+
+  const tabPanes = tab ? panes.filter((item) => item.workspaceId === workspace.id && item.tabId === tab.id) : [];
+  $("#herdr-panes-title").textContent = `ペイン · ${tabPanes.length}`;
+  $("#herdr-pane-empty").hidden = tabPanes.length > 0;
+  let selectedPane = tabPanes.find((item) => item.id === state.selectedHerdrPaneId);
+  if (!selectedPane) selectedPane = tabPanes.find((item) => item.focused) || tabPanes[0];
+  state.selectedHerdrPaneId = selectedPane?.id || null;
+  for (const pane of tabPanes) {
+    const primary = herdrLabel(pane.label, herdrLabel(pane.agent, herdrLabel(pane.title, pane.id)));
+    const secondary = [pane.agent, pane.agentStatus].filter(Boolean).join(" · ");
+    const button = herdrItemButton("herdr-pane-item", primary, secondary);
+    button.setAttribute("aria-current", String(pane.id === selectedPane?.id));
+    button.title = [pane.cwd, pane.foregroundCwd].filter(Boolean).join(" → ") || pane.id;
+    button.addEventListener("click", () => void openHerdrPane(pane));
+    panesNode.append(button);
+  }
+
+  for (const pane of agents) {
+    const label = herdrLabel(pane.agent, pane.id);
+    const button = herdrItemButton("herdr-agent-item", label, pane.agentStatus);
+    button.addEventListener("click", () => {
+      state.selectedHerdrWorkspaceId = pane.workspaceId;
+      state.selectedHerdrTabId = pane.tabId;
+      state.selectedHerdrPaneId = pane.id;
+      renderHerdr();
+      void openHerdrPane(pane);
+    });
+    agentsNode.append(button);
+  }
+}
+
+async function loadHerdr() {
+  try {
+    state.herdr = await api("/api/herdr");
+    state.herdrLoaded = true;
+    if (state.herdr.available && !state.selectedHerdrWorkspaceId) {
+      state.selectedHerdrWorkspaceId = state.herdr.focusedWorkspaceId || null;
+      state.selectedHerdrTabId = state.herdr.focusedTabId || null;
+      state.selectedHerdrPaneId = state.herdr.focusedPaneId || null;
+    }
+    renderHerdr();
+    if ($("#herdr-pane-dialog").open) {
+      const pane = state.herdr.panes.find((item) => item.id === state.selectedHerdrPaneId);
+      if (pane) {
+        $("#herdr-pane-status").textContent = herdrLabel(pane.agentStatus, "unknown");
+        $("#herdr-pane-focus-state").textContent = pane.focused ? "選択中" : "未選択";
+        $("#herdr-pane-focus-button").disabled = pane.canAct !== true;
+        $("#herdr-pane-send-button").disabled = pane.canAct !== true || pane.agentStatus === "blocked";
+      }
+    }
+  } catch (error) {
+    state.herdr = { available: false, workspaces: [], tabs: [], panes: [] };
+    state.herdrLoaded = true;
+    renderHerdr();
+    showToast(error.message, "error");
+  }
+}
+
+async function openHerdrPane(pane) {
+  if (!pane || !state.herdr) return;
+  state.selectedHerdrWorkspaceId = pane.workspaceId;
+  state.selectedHerdrTabId = pane.tabId;
+  state.selectedHerdrPaneId = pane.id;
+  const workspace = state.herdr.workspaces.find((item) => item.id === pane.workspaceId);
+  const tab = state.herdr.tabs.find((item) => item.id === pane.tabId);
+  $("#herdr-pane-title").textContent = herdrLabel(pane.label, herdrLabel(pane.agent, pane.id));
+  $("#herdr-dialog-workspace").textContent = herdrLabel(workspace?.repoName, herdrLabel(workspace?.label));
+  $("#herdr-dialog-tab").textContent = herdrLabel(tab?.label, `Tab ${tab?.number || ""}`);
+  $("#herdr-dialog-pane").textContent = herdrLabel(pane.label, pane.id);
+  $("#herdr-pane-agent").textContent = herdrLabel(pane.agent, "Pane");
+  $("#herdr-pane-status").textContent = herdrLabel(pane.agentStatus, "unknown");
+  $("#herdr-pane-output").textContent = "読込中";
+  $("#herdr-pane-focus-state").textContent = pane.focused ? "選択中" : "未選択";
+  $("#herdr-pane-focus-button").disabled = pane.canAct !== true;
+  $("#herdr-pane-action-text").value = "";
+  $("#herdr-pane-send-button").disabled = pane.canAct !== true || pane.agentStatus === "blocked";
+  const linkButton = $("#herdr-linked-session-button");
+  linkButton.hidden = !pane.sessionId;
+  if (!$("#herdr-pane-dialog").open) $("#herdr-pane-dialog").showModal();
+  state.herdrPaneRequest?.controller.abort();
+  const request = { id: pane.id, controller: new AbortController() };
+  state.herdrPaneRequest = request;
+  try {
+    const result = await api(`/api/herdr/panes/${encodeURIComponent(pane.id)}/output`, { signal: request.controller.signal });
+    if (state.herdrPaneRequest !== request || state.selectedHerdrPaneId !== pane.id) return;
+    const maxChars = 12_000;
+    const output = typeof result.text === "string" ? result.text : "";
+    $("#herdr-pane-output").textContent = output.length > maxChars ? `${output.slice(0, maxChars)}\n…（省略）` : output || "出力なし";
+  } catch (error) {
+    if (!request.controller.signal.aborted && state.herdrPaneRequest === request) $("#herdr-pane-output").textContent = error.message;
+  }
+  renderHerdr();
+}
+
+function closeHerdrPane() {
+  state.herdrPaneRequest?.controller.abort();
+  state.herdrPaneRequest = null;
+  $("#herdr-pane-dialog").close();
+}
+
+async function focusHerdrPane() {
+  const paneId = state.selectedHerdrPaneId;
+  const button = $("#herdr-pane-focus-button");
+  if (!paneId || button.disabled) return;
+  button.disabled = true;
+  try {
+    await api(`/api/herdr/panes/${encodeURIComponent(paneId)}/focus`, { method: "POST", body: "{}" });
+    $("#herdr-pane-focus-state").textContent = "フォーカス済み";
+    await loadHerdr();
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    const pane = state.herdr?.panes.find((item) => item.id === paneId);
+    button.disabled = pane?.canAct !== true;
+  }
+}
+
+async function sendHerdrInstruction(event) {
+  event.preventDefault();
+  const paneId = state.selectedHerdrPaneId;
+  const button = $("#herdr-pane-send-button");
+  const input = $("#herdr-pane-action-text");
+  const value = input.value;
+  if (!paneId || !value.trim() || button.disabled) return;
+  button.disabled = true;
+  try {
+    await api(`/api/herdr/panes/${encodeURIComponent(paneId)}/instruction`, {
+      method: "POST", body: JSON.stringify({ text: value }),
+    });
+    input.value = "";
+    $("#herdr-pane-focus-state").textContent = "送信済み";
+    await loadHerdr();
+  } catch (error) {
+    if (error.code === "herdr_instruction_uncertain" || error instanceof TypeError) {
+      showToast("送信結果不明。Herdrで確認してから再送してください。", "error");
+    } else {
+      showToast(error.message, "error");
+    }
+  } finally {
+    const pane = state.herdr?.panes.find((item) => item.id === paneId);
+    button.disabled = pane?.canAct !== true || pane.agentStatus === "blocked";
+  }
+}
+
+async function openLinkedPiSession() {
+  const pane = state.herdr?.panes.find((item) => item.id === state.selectedHerdrPaneId);
+  if (!pane?.sessionId) return;
+  closeHerdrPane();
+  const live = state.sessions.find((item) => item.sessionId === pane.sessionId && item.historyOnly !== true && item.connected);
+  if (live) {
+    setSidebarMode("live");
+    await selectSession(live.sessionId);
+    return;
+  }
+  let found = state.historyFolders.flatMap((folder) => (folder.sessions || []).map((session) => ({ ...session, cwd: folder.path })))
+    .find((session) => session.sessionId === pane.sessionId);
+  if (!found) {
+    await loadHistory();
+    found = state.historyFolders.flatMap((folder) => (folder.sessions || []).map((session) => ({ ...session, cwd: folder.path })))
+      .find((session) => session.sessionId === pane.sessionId);
+  }
+  if (found) await selectHistorySession(found);
+  else showToast("Session を開けません", "error");
+}
+
+function refreshSidebarMode() {
+  if (state.sidebarMode === "folders") void loadHistory();
+  else if (state.sidebarMode === "herdr") void loadHerdr();
+  else void refreshSessions();
+}
+
 $("#sessions-toggle").addEventListener("click", () => toggleDrawer());
 backdrop.addEventListener("click", () => toggleDrawer(false));
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") toggleDrawer(false);
 });
-$("#refresh-button").addEventListener("click", refreshSessions);
+$("#sidebar-mode-live").addEventListener("click", () => setSidebarMode("live"));
+$("#sidebar-mode-folders").addEventListener("click", () => setSidebarMode("folders"));
+$("#sidebar-mode-herdr").addEventListener("click", () => setSidebarMode("herdr"));
+$("#refresh-button").addEventListener("click", refreshSidebarMode);
 $("#session-info-button").addEventListener("click", () => sessionInfo.showModal());
 $("#close-info").addEventListener("click", () => sessionInfo.close());
 $("#model-button").addEventListener("click", () => void openModelDialog());
@@ -1083,7 +1515,14 @@ $("#privacy-info").addEventListener("click", (event) => {
 sessionInfo.addEventListener("click", (event) => {
   if (event.target === sessionInfo) sessionInfo.close();
 });
+$("#herdr-pane-dialog").addEventListener("click", (event) => {
+  if (event.target === $("#herdr-pane-dialog")) closeHerdrPane();
+});
 $("#diff-button").addEventListener("click", loadDiff);
+$("#close-herdr-pane").addEventListener("click", closeHerdrPane);
+$("#herdr-pane-focus-button").addEventListener("click", () => void focusHerdrPane());
+$("#herdr-pane-action-form").addEventListener("submit", sendHerdrInstruction);
+$("#herdr-linked-session-button").addEventListener("click", () => void openLinkedPiSession());
 $("#codex-usage-refresh").addEventListener("click", loadCodexUsage);
 $("#transcript-toggle").addEventListener("click", toggleTranscript);
 $("#jump-latest").addEventListener("click", () => {

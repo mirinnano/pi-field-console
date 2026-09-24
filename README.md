@@ -1,10 +1,10 @@
 # Pi Field Console (experimental)
 
-A small Go HTTP/SSE gateway and installable mobile-first PWA for the **already-running Pi sessions registered with pi-harness**. It does not start a second Pi runtime and does not expose the bridge Unix socket to the browser.
+A small Go HTTP/SSE gateway and installable mobile-first PWA for Pi sessions and Herdr workspaces. It does not start a second Pi runtime and does not expose the bridge Unix socket to the browser.
 
 The UI syncs the active, compaction-aware conversation by default, including user/assistant text, tool calls and arguments, tool outputs, bash commands and statuses, visible extension messages, and supported images. System prompts, hidden thinking, and compaction/branch summaries are excluded. Transcript frames are size-bounded and fetched incrementally; they are not written to bridge snapshots or event logs. The browser keeps at most 200 entries / 6 MiB in memory, does not cache API responses, and drops the oldest entries at that display limit. Use **隠す** to stop sync, abort an in-flight request, and clear the displayed transcript.
 
-The HTTP listener stays available; bridge status polling runs only while an SSE client is connected. Status snapshots are checked every 3 seconds. When a session's event sequence changes, the browser fetches its event and transcript deltas; hidden pages close SSE and abort reads. There is no fixed detail-refresh timer.
+The HTTP listener stays available; bridge status polling runs only while an SSE client is connected. Status snapshots are checked every 3 seconds. When a session's event sequence changes, the browser fetches its event and transcript deltas; hidden pages close SSE and abort reads. There is no fixed detail-refresh timer. Session history is indexed only when requested, grouped by the full recorded working directory, and never scans transcript bodies for its listing. Selecting an offline session explicitly loads its bounded, read-only transcript.
 
 The console can send a follow-up, switch the active session's model while Pi is idle, and explicitly fetch Codex 5-hour / 7-day quota while using an `openai-codex` model.
 Model changes do not alter Pi's default.
@@ -13,7 +13,7 @@ Codex quota is a separate account-level value.
 Quota lookup is user-triggered, uses Pi's in-process auth, and returns only usage percentages/reset times to the browser.
 It follows the request pattern in [`pi-chatgpt-limit`](https://github.com/patlux/pi-chatgpt-limit); that extension has no stable API, so this app does not install it or depend on private module exports.
 The fixed `chatgpt.com/backend-api/wham/usage` endpoint is undocumented and may change.
-No shell, approval, pause, or arbitrary command endpoint is exposed.
+The Herdr view lists workspaces → tabs → panes and recognized agents. Pane output loads only when selected; focus and single-agent instructions are explicit. It calls fixed Herdr CLI argv, validates current pane/agent membership, sanitizes terminal output, and never broadcasts. The standalone Pi [`pi-herdr-orchestrator`](https://github.com/mirinnano/pi-herdr-orchestrator) adds separate boss/worker tools: `herdr_swarm` can create a restricted long-lived Pi worker in a positively idle pane, dispatch up to four distinct acceptance-tested assignments to existing idle workers, and collect correlated replies; `herdr_worker` provides structured reports, can deliver one to an idle named supervisor and wait for acknowledgment, and supports request/reply questions. `select_model` lists this Pi session's available models and switches only that session. Spawned task-scoped subagents remain a separate mechanism. Pre-existing peers may not have the same tool restrictions as workers created through `start`. No shell, approval, pause, or arbitrary command endpoint is exposed.
 
 ## UI reference
 
@@ -28,11 +28,12 @@ All have system fallbacks and are not bundled.
 
 ## Enable the web console in pi-harness
 
-The companion patch updates the pi-harness bridge and extension for transcript sync, model listing/switching, context telemetry, action-sequence refreshes, and on-demand Codex quota. Model metadata is allowlisted; API URLs and headers are not exposed. Switching validates an exact available-model pair and is session-local. Codex usage uses Pi's active Codex credential only inside the extension process; the browser receives 5-hour / 7-day percentages and reset times, never the token, email, or plan. It targets pi-harness commit `ea1b2f32eda2fcba326717b2f2e9fb08b8be9ee7` and changes only the files included in [`integrations/pi-harness-console.patch`](integrations/pi-harness-console.patch).
+Two companion patches update pi-harness. The core patch adds transcript sync, model listing/switching, context telemetry, action-sequence refreshes, and on-demand Codex quota. The Herdr patch adds local session/Herdr identity metadata, the opt-in boss/worker orchestration tools, and active-model switching support; it must be applied after the core patch. The Go API strips session-file paths and Herdr IDs from public session/SSE payloads. Codex usage uses Pi's active Codex credential only inside the extension process; the browser receives quota percentages and reset times, never the token, email, or plan. Both patches target pi-harness commit `ea1b2f32eda2fcba326717b2f2e9fb08b8be9ee7`.
 
 ```sh
 cd /path/to/pi-harness
 git apply --unidiff-zero /path/to/pi-field-console/integrations/pi-harness-console.patch
+git apply /path/to/pi-field-console/integrations/pi-harness-herdr.patch
 npm run check
 npm test
 ```
@@ -49,6 +50,10 @@ go run .
 
 Open <http://127.0.0.1:8765>. The PWA can be installed from a compatible browser; service-worker caching is limited to the static app shell. API responses and session content are never cached.
 
+History roots include the normal Pi session directory, an absolute `sessionDir` from Pi settings or `PI_CODING_AGENT_SESSION_DIR`, bridge-registered custom directories, and comma-separated explicit roots from `PI_REMOTE_SESSION_DIRS`. The browser cannot choose filesystem paths. Index results expose full recorded `cwd` values but never session-file paths. Indexing is read-only and bounded; transcript content is read only after selecting an individual session.
+
+When running the server inside Herdr, keep `HERDR_ENV=1` and `HERDR_SOCKET_PATH` in its environment. Herdr access is disabled unless both are present. Pane prompts are sent once; an ambiguous timeout is reported and never retried.
+
 Environment:
 
 | Variable | Default | Purpose |
@@ -58,6 +63,10 @@ Environment:
 | `PI_REMOTE_PORT` | `8765` | Local HTTP port |
 | `PI_REMOTE_ALLOWED_HOSTS` | loopback hosts only | Comma-separated exact DNS hosts permitted behind an explicit reverse proxy |
 | `PI_REMOTE_ALLOWED_ORIGINS` | same-origin only | Optional exact `https://…` origins for a trusted reverse proxy |
+| `PI_CODING_AGENT_DIR` | `~/.pi/agent` | Pi agent root used to find the default `sessions` directory and settings |
+| `PI_CODING_AGENT_SESSION_DIR` | Pi default | Optional absolute custom session root |
+| `PI_REMOTE_SESSION_DIRS` | empty | Explicit comma-separated absolute session roots |
+| `HERDR_ENV`, `HERDR_SOCKET_PATH` | unset | Enable Herdr snapshot and pane actions only inside a Herdr-managed environment |
 
 ## Remote access boundary
 
