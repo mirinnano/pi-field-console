@@ -1,9 +1,9 @@
 const $ = (selector, root = document) => root.querySelector(selector);
 const state = {
   sessions: [], selectedId: null, connected: false,
-  events: new Map(), cursors: new Map(), sentMessages: new Map(), transcripts: new Map(), transcriptCursors: new Map(),
-  transcriptEnabled: true, transcriptLoadingFor: null, transcriptRequest: null,
-  tasks: new Map(), diffs: new Map(), stream: null, toastTimer: null, refreshTimer: null,
+  events: new Map(), cursors: new Map(), sentMessages: new Map(), transcripts: new Map(), transcriptCursors: new Map(), detailRefreshes: new Map(),
+  transcriptEnabled: true, transcriptLoadingFor: null, transcriptRequest: null, refreshAfterResume: false,
+  tasks: new Map(), diffs: new Map(), stream: null, liveConnected: false, toastTimer: null, refreshTimer: null,
   sessionSignature: "",
 };
 const MAX_TRANSCRIPT_MESSAGES = 200;
@@ -535,11 +535,23 @@ function cancelTranscriptRequest() {
   request?.controller.abort();
 }
 
+function cancelDetailRefresh(sessionId) {
+  const controller = state.detailRefreshes.get(sessionId);
+  if (!controller) return;
+  state.detailRefreshes.delete(sessionId);
+  controller.abort();
+}
+
+function cancelAllDetailRefreshes() {
+  for (const sessionId of state.detailRefreshes.keys()) cancelDetailRefresh(sessionId);
+}
+
 async function selectSession(sessionId) {
   if (state.selectedId === sessionId) {
     toggleDrawer(false);
     return;
   }
+  cancelDetailRefresh(state.selectedId);
   cancelTranscriptRequest();
   state.transcripts.clear();
   state.transcriptCursors.clear();
@@ -554,7 +566,17 @@ async function selectSession(sessionId) {
 
 async function refreshDetails(reset = false) {
   const sessionId = state.selectedId;
-  if (!sessionId) return;
+  if (!sessionId || state.detailRefreshes.has(sessionId)) return;
+  const controller = new AbortController();
+  state.detailRefreshes.set(sessionId, controller);
+  try {
+    await refreshDetailsForSession(sessionId, reset, controller.signal);
+  } finally {
+    if (state.detailRefreshes.get(sessionId) === controller) state.detailRefreshes.delete(sessionId);
+  }
+}
+
+async function refreshDetailsForSession(sessionId, reset, signal) {
   const session = state.sessions.find((item) => item.sessionId === sessionId);
   if (!session) return;
   if (reset) {
@@ -569,7 +591,7 @@ async function refreshDetails(reset = false) {
 
   const after = state.cursors.get(sessionId) || 0;
   try {
-    const result = await api(`/api/sessions/${encodeURIComponent(sessionId)}/events?after=${after}`);
+    const result = await api(`/api/sessions/${encodeURIComponent(sessionId)}/events?after=${after}`, { signal });
     const previous = state.events.get(sessionId) || [];
     if (result.dropped) {
       state.events.set(sessionId, []);
@@ -584,20 +606,24 @@ async function refreshDetails(reset = false) {
     state.cursors.set(sessionId, Number.isSafeInteger(result.cursor) ? result.cursor : after);
     if (changed && state.selectedId === sessionId) renderMessages();
   } catch (error) {
+    if (signal.aborted) return;
     if (reset && state.selectedId === sessionId) showToast(error.message, "error");
   }
+  if (signal.aborted) return;
 
   if (!session.connected) {
     renderTasks();
     return;
   }
   try {
-    const tasks = await api(`/api/sessions/${encodeURIComponent(sessionId)}/tasks`);
+    const tasks = await api(`/api/sessions/${encodeURIComponent(sessionId)}/tasks`, { signal });
     state.tasks.set(sessionId, tasks);
     if (state.selectedId === sessionId) renderTasks();
   } catch (error) {
+    if (signal.aborted) return;
     if (reset && state.selectedId === sessionId) showToast(error.message, "error");
   }
+  if (signal.aborted) return;
   if (state.transcriptEnabled && state.selectedId === sessionId) void refreshTranscript(reset);
 }
 
@@ -744,6 +770,7 @@ function applySnapshot(payload) {
   const selected = state.sessions.find((session) => session.sessionId === state.selectedId);
   updateHeader(selected);
   if (previousSelection !== state.selectedId) {
+    cancelDetailRefresh(previousSelection);
     cancelTranscriptRequest();
     state.transcripts.clear();
     state.transcriptCursors.clear();
@@ -753,13 +780,55 @@ function applySnapshot(payload) {
   }
 }
 
-function connectLive() {
-  const stream = new EventSource("/api/live");
-  state.stream = stream;
-  stream.addEventListener("message", (event) => {
-    try { applySnapshot(JSON.parse(event.data)); } catch { /* Ignore malformed bridge updates. */ }
-  });
-  stream.addEventListener("error", () => setConnection(false));
+function clearRefreshTimer() {
+  if (state.refreshTimer !== null) {
+    clearInterval(state.refreshTimer);
+    state.refreshTimer = null;
+  }
+}
+
+function stopActiveConnection() {
+  clearRefreshTimer();
+  cancelAllDetailRefreshes();
+  cancelTranscriptRequest();
+  const stream = state.stream;
+  if (stream) state.refreshAfterResume = true;
+  state.liveConnected = false;
+  state.stream = null;
+  stream?.close();
+}
+
+function startActiveConnection() {
+  if (document.visibilityState === "hidden") return;
+  if (!state.stream) {
+    const stream = new EventSource("/api/live");
+    state.stream = stream;
+    stream.addEventListener("open", () => {
+      if (state.stream !== stream) return;
+      state.liveConnected = true;
+      if (state.refreshTimer === null) {
+        state.refreshTimer = setInterval(() => {
+          const session = state.sessions.find((item) => item.sessionId === state.selectedId);
+          if (state.liveConnected && state.connected && session?.connected && document.visibilityState !== "hidden") void refreshDetails(false);
+        }, 8000);
+      }
+    });
+    stream.addEventListener("message", (event) => {
+      const previousSelection = state.selectedId;
+      try { applySnapshot(JSON.parse(event.data)); } catch { return; }
+      if (state.refreshAfterResume) {
+        state.refreshAfterResume = false;
+        if (state.selectedId && state.selectedId === previousSelection) void refreshDetails(false);
+      }
+    });
+    stream.addEventListener("error", () => {
+      if (state.stream !== stream) return;
+      state.liveConnected = false;
+      state.refreshAfterResume = true;
+      clearRefreshTimer();
+      setConnection(false);
+    });
+  }
 }
 
 async function refreshSessions() {
@@ -795,9 +864,13 @@ composer.addEventListener("keydown", (event) => {
     $("#instruction-form").requestSubmit();
   }
 });
-connectLive();
-refreshSessions();
-state.refreshTimer = setInterval(() => refreshDetails(false), 8000);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") stopActiveConnection();
+  else startActiveConnection();
+});
+window.addEventListener("pagehide", stopActiveConnection);
+window.addEventListener("pageshow", startActiveConnection);
+startActiveConnection();
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => {}));
 }

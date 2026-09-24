@@ -1,4 +1,4 @@
-const CACHE = "pi-field-console-v3";
+const CACHE = "pi-field-console-v5";
 const SHELL = ["/", "/app.css", "/app.js", "/manifest.webmanifest", "/icon.svg"];
 
 self.addEventListener("install", (event) => {

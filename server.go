@@ -374,13 +374,19 @@ func validSessionID(value string) bool { return sessionIDPattern.MatchString(val
 // liveHub broadcasts only bridge snapshots; each subscriber has a single-slot
 // queue so a slow browser cannot backpressure bridge polling.
 type liveHub struct {
-	mu          sync.Mutex
-	subscribers map[chan []byte]struct{}
-	current     []byte
+	mu            sync.Mutex
+	subscribers   map[chan []byte]struct{}
+	current       []byte
+	activity      chan struct{}
+	pollingCancel context.CancelFunc
 }
 
 func newLiveHub() *liveHub {
-	return &liveHub{current: []byte(`{"type":"snapshot","connected":false,"sessions":[]}`), subscribers: make(map[chan []byte]struct{})}
+	return &liveHub{
+		current:     []byte(`{"type":"snapshot","connected":false,"sessions":[]}`),
+		subscribers: make(map[chan []byte]struct{}),
+		activity:    make(chan struct{}, 1),
+	}
 }
 
 func (h *liveHub) publish(connected bool, sessions json.RawMessage) {
@@ -415,16 +421,73 @@ func (h *liveHub) publish(connected bool, sessions json.RawMessage) {
 	h.mu.Unlock()
 }
 
+func (h *liveHub) notifyActivityLocked() {
+	select {
+	case h.activity <- struct{}{}:
+	default:
+	}
+}
+
+func (h *liveHub) hasSubscribers() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.subscribers) > 0
+}
+
+func (h *liveHub) waitForSubscribers(ctx context.Context) bool {
+	for {
+		if h.hasSubscribers() {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-h.activity:
+		}
+	}
+}
+
+func (h *liveHub) setPollingCancel(cancel context.CancelFunc) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.subscribers) == 0 {
+		return false
+	}
+	h.pollingCancel = cancel
+	return true
+}
+
+func (h *liveHub) clearPollingCancel() {
+	h.mu.Lock()
+	h.pollingCancel = nil
+	h.mu.Unlock()
+}
+
 func (h *liveHub) subscribe() (chan []byte, func()) {
 	channel := make(chan []byte, 1)
 	h.mu.Lock()
+	wasIdle := len(h.subscribers) == 0
 	h.subscribers[channel] = struct{}{}
 	channel <- append([]byte(nil), h.current...)
+	if wasIdle {
+		h.notifyActivityLocked()
+	}
 	h.mu.Unlock()
 	return channel, func() {
+		var cancel context.CancelFunc
 		h.mu.Lock()
-		delete(h.subscribers, channel)
+		if _, ok := h.subscribers[channel]; ok {
+			delete(h.subscribers, channel)
+			if len(h.subscribers) == 0 {
+				cancel = h.pollingCancel
+				h.pollingCancel = nil
+				h.notifyActivityLocked()
+			}
+		}
 		h.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
 	}
 }
 
@@ -432,8 +495,50 @@ func (s *service) pollBridge(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 3 * time.Second
 	}
+	for {
+		if !s.hub.waitForSubscribers(ctx) {
+			return
+		}
+		pollCtx, cancel := context.WithCancel(ctx)
+		if !s.hub.setPollingCancel(cancel) {
+			cancel()
+			continue
+		}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			s.pollBridgeWhileActive(pollCtx, interval)
+		}()
+
+	active:
+		for {
+			select {
+			case <-ctx.Done():
+				cancel()
+				<-done
+				s.hub.clearPollingCancel()
+				return
+			case <-s.hub.activity:
+				if !s.hub.hasSubscribers() || pollCtx.Err() != nil {
+					cancel()
+					<-done
+					s.hub.clearPollingCancel()
+					break active
+				}
+			}
+		}
+	}
+}
+
+func (s *service) pollBridgeWhileActive(ctx context.Context, interval time.Duration) {
 	poll := func() {
+		if ctx.Err() != nil || !s.hub.hasSubscribers() {
+			return
+		}
 		data, err := s.bridgeRequest(ctx, "request_status", "", nil)
+		if ctx.Err() != nil {
+			return
+		}
 		if err != nil {
 			s.hub.publish(false, json.RawMessage("[]"))
 			return
@@ -445,9 +550,10 @@ func (s *service) pollBridge(ctx context.Context, interval time.Duration) {
 		}
 		s.hub.publish(true, data)
 	}
-	poll()
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	poll()
 	for {
 		select {
 		case <-ctx.Done():

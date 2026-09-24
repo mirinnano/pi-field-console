@@ -364,6 +364,119 @@ func TestListenAddressCannotBindPublicInterface(t *testing.T) {
 	}
 }
 
+func TestPollBridgeRunsOnlyWhileLiveClientsAreConnected(t *testing.T) {
+	socketPath, calls := startFakeBridge(t)
+	app := newService(socketPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		app.pollBridge(ctx, 200*time.Millisecond)
+	}()
+
+	assertQuiet := func(duration time.Duration) {
+		t.Helper()
+		select {
+		case call := <-calls:
+			t.Fatalf("unexpected bridge poll without an active live client: %+v", call)
+		case <-time.After(duration):
+		}
+	}
+	awaitStatus := func() {
+		t.Helper()
+		select {
+		case call := <-calls:
+			if call.Command != "request_status" {
+				t.Fatalf("unexpected active poll command: %+v", call)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("active live client did not start bridge polling")
+		}
+	}
+
+	assertQuiet(80 * time.Millisecond)
+	_, unsubscribeFirst := app.hub.subscribe()
+	awaitStatus()
+	_, unsubscribeSecond := app.hub.subscribe()
+	unsubscribeFirst()
+	awaitStatus()
+	unsubscribeSecond()
+	assertQuiet(250 * time.Millisecond)
+
+	_, unsubscribeThird := app.hub.subscribe()
+	awaitStatus()
+	unsubscribeThird()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("poll worker did not stop after cancellation")
+	}
+}
+
+func TestLastLiveClientDisconnectCancelsInFlightBridgePoll(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "ph-poll-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socketPath := dir + "/b.sock"
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	requestSeen := make(chan struct{})
+	readError := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			readError <- err
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		if _, err := reader.ReadBytes('\n'); err != nil {
+			readError <- err
+			return
+		}
+		close(requestSeen)
+		_, err = reader.ReadByte()
+		readError <- err
+	}()
+
+	app := newService(socketPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pollerDone := make(chan struct{})
+	go func() {
+		defer close(pollerDone)
+		app.pollBridge(ctx, time.Second)
+	}()
+	_, unsubscribe := app.hub.subscribe()
+	select {
+	case <-requestSeen:
+	case <-time.After(time.Second):
+		t.Fatal("active client did not start a bridge poll")
+	}
+	unsubscribe()
+	select {
+	case err := <-readError:
+		if err == nil {
+			t.Fatal("last client disconnect did not close the bridge poll socket")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("in-flight bridge poll continued after last client disconnected")
+	}
+	cancel()
+	select {
+	case <-pollerDone:
+	case <-time.After(time.Second):
+		t.Fatal("poller did not stop after cancellation")
+	}
+}
+
 func TestLiveSSESnapshot(t *testing.T) {
 	server := httptest.NewServer(testHandler(t, "/missing.sock"))
 	defer server.Close()

@@ -4,6 +4,8 @@ A small Go HTTP/SSE gateway and installable mobile-first PWA for the **already-r
 
 The UI syncs the active, compaction-aware conversation by default, including user/assistant text, tool calls and arguments, tool outputs, bash commands and statuses, visible extension messages, and supported images. System prompts, hidden thinking, and compaction/branch summaries are excluded. Transcript frames are size-bounded and fetched incrementally; they are not written to bridge snapshots or event logs. The browser keeps at most 200 entries / 6 MiB in memory, does not cache API responses, and drops the oldest entries at that display limit. Use **会話を隠す** to stop sync, abort an in-flight request, and clear the displayed transcript.
 
+The lightweight HTTP listener stays available so a new browser can wake the console. Background bridge status polling runs only while at least one live browser connection is open, and stops when the last connection closes. The browser closes its live stream and periodic detail refresh while hidden; explicit requests still run on demand. Thus the Go process remains idle-ready, but does not continuously poll the Pi bridge without an active page.
+
 The only write operation is `send_instruction`, delivered to Pi as a follow-up user message. There is no shell, approval, pause, or arbitrary command endpoint.
 
 ## UI reference

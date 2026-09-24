@@ -31,12 +31,13 @@ func main() {
 	app := newService(bridgePath)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Keep the lightweight listener ready for new browsers; bridge polling sleeps without a live SSE client.
 	go app.pollBridge(ctx, 3*time.Second)
 
 	server := &http.Server{
 		Handler:           app.handler(cfg, webAssets),
 		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       90 * time.Second,
+		IdleTimeout:       30 * time.Second,
 		MaxHeaderBytes:    16 * 1024,
 	}
 	go func() {
