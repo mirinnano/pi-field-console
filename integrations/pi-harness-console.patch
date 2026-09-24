@@ -1,0 +1,777 @@
+diff --git a/docs/frame.schema.json b/docs/frame.schema.json
+index da316f4..f704f0a 100644
+--- a/docs/frame.schema.json
++++ b/docs/frame.schema.json
+@@ -17 +17 @@
+-      "enum": ["send_instruction", "pause", "resume", "approve", "reject", "request_diff", "request_status", "request_task_state", "request_events"]
++      "enum": ["send_instruction", "pause", "resume", "approve", "reject", "request_diff", "request_status", "request_task_state", "request_events", "request_transcript", "request_models", "request_codex_usage", "switch_model"]
+@@ -29 +29,2 @@
+-        "resumed": { "type": "boolean" }
++        "resumed": { "type": "boolean" },
++        "model": { "type": ["object", "null"], "properties": { "provider": { "type": "string", "maxLength": 120 }, "id": { "type": "string", "maxLength": 120 }, "name": { "type": "string", "maxLength": 120 }, "reasoning": { "type": "boolean" }, "contextWindow": { "type": "integer", "minimum": 1 } }, "required": ["provider", "id"], "additionalProperties": false }
+@@ -37 +38,2 @@
+-        "summary": { "type": "string" }, "telemetry": { "type": "object" }
++        "summary": { "type": "string" }, "telemetry": { "type": "object" },
++        "model": { "type": "object", "properties": { "provider": { "type": "string", "maxLength": 120 }, "id": { "type": "string", "maxLength": 120 } }, "required": ["provider", "id"], "additionalProperties": true }
+@@ -46 +48,2 @@
+-        "after": { "type": "integer", "minimum": 0 }
++        "after": { "type": "integer", "minimum": 0 }, "afterEntryId": { "$ref": "#/$defs/id" },
++        "provider": { "type": "string", "maxLength": 120 }, "modelId": { "type": "string", "maxLength": 120 }
+@@ -53 +56,2 @@
+-        "command": { "$ref": "#/$defs/commandName" }, "text": { "type": "string" }
++        "command": { "$ref": "#/$defs/commandName" }, "text": { "type": "string" }, "afterEntryId": { "$ref": "#/$defs/id" },
++        "provider": { "type": "string", "maxLength": 120 }, "modelId": { "type": "string", "maxLength": 120 }
+diff --git a/docs/protocol.md b/docs/protocol.md
+index eadcb31..342243a 100644
+--- a/docs/protocol.md
++++ b/docs/protocol.md
+@@ -3 +3 @@
+-Unix domain socket上でUTF-8のJSON objectをLF (`\n`) 区切りで流します。各frameは最大64 KiB、`v: 1` 必須です。socketは利用者専用ディレクトリ内に作成し、socket modeは0600です。PiのRPC protocolとは別物です。
++Unix domain socket上でUTF-8のJSON objectをLF (`\n`) 区切りで流します。各frameは最大8 MiB、`v: 1` 必須です。socketは利用者専用ディレクトリ内に作成し、socket modeは0600です。PiのRPC protocolとは別物です。
+@@ -19 +19 @@ Frameの機械可読な定義は[frame.schema.json](frame.schema.json)です。
+-`register`には比較用の任意fieldとして`profile`、`variant`、`caseId`、`baseCommit`、`resumed`を添えられます。`safe-pi --case-id`で開始した場合、Git rootかつclean workspaceを確認し、bridgeは開始commitと拡張構成をsnapshotに保存します。再接続回数も`registrations`として数え、再開sessionの印とともに比較時の集計漏れを検出します。telemetryの`models`には実応答したprovider/modelを記録し、比較時に一致を要求します。課題IDは同じpromptや他のruntime設定まで保証しないため、別途条件を揃えます。
++`register`には比較用の任意fieldとして`profile`、`variant`、`caseId`、`baseCommit`、`resumed`と、現在modelの安全な参照（`provider`/`id`のみ）を添えられます。`safe-pi --case-id`で開始した場合、Git rootかつclean workspaceを確認し、bridgeは開始commitと拡張構成をsnapshotに保存します。再接続回数も`registrations`として数え、再開sessionの印とともに比較時の集計漏れを検出します。telemetryの`models`には実応答したprovider/modelを記録し、比較時に一致を要求します。課題IDは同じpromptや他のruntime設定まで保証しないため、別途条件を揃えます。
+@@ -33,0 +34,4 @@ Frameの機械可読な定義は[frame.schema.json](frame.schema.json)です。
++| `request_transcript` | 実装済み | 接続中Piのcompaction-aware contextから表示可能な会話を最大80 entry・6 MiBずつ取得。`afterEntryId`で増分取得する。user/assistant、`display: true`のcustom message、tool call/arguments/result、bash command/output/status、画像を含む。system prompt、hidden thinking、compaction/branch summaryは除外し、bridge側へ保存しない |
++| `request_models` | 実装済み | 利用可能modelの先頭200件をprovider、ID、表示名、reasoning対応、context windowに限定して返す。URLやheadersなどは返さない |
++| `request_codex_usage` | 実装済み | 明示要求時だけ、Piの`openai-codex`認証を使って固定HTTPS endpointからquotaを取得。5時間・7日の使用率とreset時刻だけ返し、token/email/planは転送しない |
++| `switch_model` | 実装済み | `provider`と`modelId`の完全一致でPiの利用可能modelを検証し、現在sessionだけ切り替える。実行中は拒否。設定の既定modelは変更しない |
+@@ -40 +44,7 @@ Frameの機械可読な定義は[frame.schema.json](frame.schema.json)です。
+-`send_instruction` の成功はPiが入力を受け付けた意味であり、作業完了ではありません。`request_diff` はPiの作業ディレクトリで実行します。commandはallowlistで判定し、shell文字列を実行する操作はありません。
++`send_instruction` の成功はPiが入力を受け付けた意味であり、作業完了ではありません。
++`request_diff` はPiの作業ディレクトリで実行します。
++command は allowlist で判定し、shell 文字列を実行する操作はありません。
++Codex Usage は Web 画面から明示的に要求された場合だけ取得します。
++Extension は access token を Pi プロセス内で使用し、bridge とブラウザへ返しません。
++実装は [`pi-chatgpt-limit`](https://github.com/patlux/pi-chatgpt-limit) の取得形式を参考にしていますが、その拡張には安定した外部 API がないため依存・インストールはしません。
++`wham/usage` は非公開 API であり、応答形式や利用可否は保証されません。
+@@ -44 +54,3 @@ Frameの機械可読な定義は[frame.schema.json](frame.schema.json)です。
+-実装済み: `SessionStarted`, `TaskStarted`, `TaskUpdated`, `ToolStarted`, `ToolFinished`, `VerificationFailed`, `SessionCompleted`。`TaskUpdated`にmain model、pi-subagents、外部要約モデルの基礎telemetryを含めます。将来の語彙: `ApprovalRequired`, `DiffReady`, `AgentStuck`, `AgentQuestion`。未知eventを受信するfrontendは無視できる設計にします。
++実装済み: `SessionStarted`, `TaskStarted`, `TaskUpdated`, `ToolStarted`, `ToolFinished`, `ModelChanged`, `VerificationFailed`, `SessionCompleted`。イベントごとに`eventSeq`が進み、接続中consoleは通常3秒間隔のstatus snapshotで変化を検出し、対象sessionの差分だけ取得します（SSE自体は状態snapshotを配信）。`TaskUpdated`にmain model、pi-subagents、外部要約モデルの基礎telemetryとcontext使用量を含めます。将来の語彙: `ApprovalRequired`, `DiffReady`, `AgentStuck`, `AgentQuestion`。未知eventを受信するfrontendは無視できる設計にします。
++
++`request_transcript`はweb consoleから既定で取得します。tool arguments/outputと画像を含む会話内容が、bridge daemonを経由して許可済みweb browserへ送信されます。Pi extensionはactive branchのcompaction-aware contextからその場で返し、bridge daemonはtranscriptをsnapshot・JSONL event logへ保存しません。画面側も受け取った内容をブラウザのメモリにだけ保持します。ネットワーク公開する場合は、信頼できるHTTPS/VPN proxyの認証とアクセス制御を必須にしてください。
+diff --git a/extensions/bridge.ts b/extensions/bridge.ts
+index e970390..a9ed957 100644
+--- a/extensions/bridge.ts
++++ b/extensions/bridge.ts
+@@ -6,0 +7,14 @@ const MAX_LINE_BYTES = 64 * 1024;
++const MAX_TRANSCRIPT_LINE_BYTES = 8 * 1024 * 1024;
++const MAX_MODEL_LINE_BYTES = 512 * 1024;
++const MAX_TRANSCRIPT_MESSAGES = 80;
++const MAX_TRANSCRIPT_BYTES = 6 * 1024 * 1024;
++const MAX_TRANSCRIPT_TEXT_BYTES = 128 * 1024;
++const MAX_TRANSCRIPT_IMAGE_BYTES = 2 * 1024 * 1024;
++const MAX_TRANSCRIPT_TOOL_ARGUMENT_BYTES = 64 * 1024;
++const MAX_TRANSCRIPT_ENTRY_BYTES = 3 * 1024 * 1024;
++const MAX_TRANSCRIPT_ENTRY_CONTENT_BYTES = MAX_TRANSCRIPT_ENTRY_BYTES - 256 * 1024;
++const TRANSCRIPT_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
++const MAX_AVAILABLE_MODELS = 200;
++const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
++const CODEX_USAGE_CACHE_MS = 60_000;
++const MAX_CODEX_USAGE_RESPONSE_BYTES = 64 * 1024;
+@@ -27,0 +42,284 @@ function readTaskState(ctx: ExtensionContext) {
++function modelRef(model: unknown) {
++  if (!model || typeof model !== "object") return null;
++  const item = model as Record<string, unknown>;
++  if (typeof item.provider !== "string" || typeof item.id !== "string" || Buffer.byteLength(item.provider, "utf8") > 120 || Buffer.byteLength(item.id, "utf8") > 120 || /[\u0000-\u001f\u007f]/.test(item.provider + item.id)) return null;
++  return { provider: item.provider, id: item.id };
++}
++
++function publicModel(model: unknown) {
++  const ref = modelRef(model);
++  if (!ref || !model || typeof model !== "object") return null;
++  const item = model as Record<string, unknown>;
++  return {
++    ...ref,
++    ...(typeof item.name === "string" ? { name: truncateUtf8(item.name, 120).text } : {}),
++    reasoning: item.reasoning === true,
++    ...(Number.isSafeInteger(item.contextWindow) && (item.contextWindow as number) > 0 ? { contextWindow: item.contextWindow } : {}),
++  };
++}
++
++export function readModels(ctx: ExtensionContext) {
++  const available = ctx.modelRegistry.getAvailable();
++  const models = available.slice(0, MAX_AVAILABLE_MODELS).flatMap((model) => {
++    const projected = publicModel(model);
++    return projected ? [projected] : [];
++  });
++  return { current: publicModel(ctx.model), models, truncated: available.length > MAX_AVAILABLE_MODELS };
++}
++
++function codexAccountId(token: string) {
++  try {
++    const encodedPayload = token.split(".")[1];
++    if (!encodedPayload) return undefined;
++    const payload: unknown = JSON.parse(Buffer.from(encodedPayload, "base64url").toString("utf8"));
++    if (!payload || typeof payload !== "object") return undefined;
++    const auth = (payload as Record<string, unknown>)["https://api.openai.com/auth"];
++    if (!auth || typeof auth !== "object") return undefined;
++    const accountId = (auth as Record<string, unknown>).chatgpt_account_id;
++    return typeof accountId === "string" && /^[A-Za-z0-9_-]{1,256}$/.test(accountId) ? accountId : undefined;
++  } catch {
++    return undefined;
++  }
++}
++
++function codexWindow(value: unknown, duration: number) {
++  if (!value || typeof value !== "object") return null;
++  const item = value as Record<string, unknown>;
++  if (typeof item.used_percent !== "number" || !Number.isFinite(item.used_percent)
++    || typeof item.limit_window_seconds !== "number" || !Number.isFinite(item.limit_window_seconds)
++    || Math.abs(item.limit_window_seconds - duration) > 120) return null;
++  return {
++    usedPercent: Math.max(0, Math.min(100, item.used_percent)),
++    ...(Number.isSafeInteger(item.reset_at) && (item.reset_at as number) > 0 ? { resetAt: item.reset_at } : {}),
++  };
++}
++
++export async function readCodexUsage(ctx: ExtensionContext) {
++  const model = ctx.model;
++  if (!model || !(model.provider === "openai-codex" || /^openai-codex-[0-9]+$/.test(model.provider))) return null;
++  let auth;
++  try {
++    auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
++  } catch {
++    throw new Error("Codex auth unavailable");
++  }
++  if (!auth.ok || typeof auth.apiKey !== "string" || !auth.apiKey) throw new Error("Codex auth unavailable");
++
++  const headers: Record<string, string> = {
++    Authorization: `Bearer ${auth.apiKey}`,
++    Accept: "application/json",
++    "User-Agent": "pi-field-console",
++  };
++  const accountId = codexAccountId(auth.apiKey);
++  if (accountId) headers["chatgpt-account-id"] = accountId;
++
++  try {
++    const response = await fetch(CODEX_USAGE_URL, {
++      method: "GET", headers, redirect: "error", cache: "no-store", signal: AbortSignal.timeout(15_000),
++    });
++    if (!response.ok) throw new Error("Codex usage unavailable");
++    const body = await response.text();
++    if (Buffer.byteLength(body, "utf8") > MAX_CODEX_USAGE_RESPONSE_BYTES) throw new Error("Codex usage unavailable");
++    const data: unknown = JSON.parse(body);
++    if (!data || typeof data !== "object") throw new Error("Codex usage unavailable");
++    const rateLimit = (data as Record<string, unknown>).rate_limit;
++    const limits = rateLimit && typeof rateLimit === "object" ? rateLimit as Record<string, unknown> : {};
++    return {
++      fiveHour: codexWindow(limits.primary_window, 5 * 60 * 60) ?? codexWindow(limits.secondary_window, 5 * 60 * 60),
++      weekly: codexWindow(limits.primary_window, 7 * 24 * 60 * 60) ?? codexWindow(limits.secondary_window, 7 * 24 * 60 * 60),
++      fetchedAt: Date.now(),
++    };
++  } catch {
++    throw new Error("Codex usage unavailable");
++  }
++}
++
++export function resolveAvailableModel(ctx: ExtensionContext, provider: unknown, modelId: unknown) {
++  if (typeof provider !== "string" || !provider || Buffer.byteLength(provider, "utf8") > 120 || typeof modelId !== "string" || !modelId || Buffer.byteLength(modelId, "utf8") > 120 || /[\u0000-\u001f\u007f]/.test(provider + modelId)) return undefined;
++  return ctx.modelRegistry.getAvailable().find((model) => model.provider === provider && model.id === modelId);
++}
++
++export async function switchAvailableModel(pi: ExtensionAPI, ctx: ExtensionContext, provider: unknown, modelId: unknown) {
++  if (!ctx.isIdle()) throw new Error("session busy");
++  const model = resolveAvailableModel(ctx, provider, modelId);
++  if (!model) throw new Error("model unavailable");
++  if (!await pi.setModel(model)) throw new Error("model authentication unavailable");
++  return { current: publicModel(model) };
++}
++
++function cleanTranscriptText(value: string): string {
++  return value.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, " ");
++}
++
++function truncateUtf8(value: string, maxBytes: number): { text: string; truncated: boolean } {
++  const cleaned = cleanTranscriptText(value);
++  if (Buffer.byteLength(cleaned, "utf8") <= maxBytes) return { text: cleaned, truncated: false };
++  if (maxBytes <= 0) return { text: "", truncated: true };
++  const fullSuffix = "\n…（省略）";
++  const suffix = Buffer.byteLength(fullSuffix, "utf8") <= maxBytes ? fullSuffix : maxBytes >= 3 ? "…" : ".".repeat(maxBytes);
++  const budget = maxBytes - Buffer.byteLength(suffix, "utf8");
++  let text = "";
++  let bytes = 0;
++  for (const character of cleaned) {
++    const size = Buffer.byteLength(character, "utf8");
++    if (bytes + size > budget) break;
++    text += character;
++    bytes += size;
++  }
++  return { text: text.trimEnd() + suffix, truncated: true };
++}
++
++function transcriptBlocks(content: unknown) {
++  const blocks: Record<string, unknown>[] = [];
++  let textBytes = 0;
++  let imageBytes = 0;
++  let blocksBytes = 2; // JSON encoding of an empty array.
++  let truncated = false;
++  const values = typeof content === "string" ? [{ type: "text", text: content }] : Array.isArray(content) ? content : [];
++  const appendBlock = (block: Record<string, unknown>) => {
++    const size = Buffer.byteLength(JSON.stringify(block), "utf8") + (blocks.length > 0 ? 1 : 0);
++    if (blocksBytes + size > MAX_TRANSCRIPT_ENTRY_CONTENT_BYTES) {
++      truncated = true;
++      const placeholder = { type: "text", text: "[Transcript content omitted at the entry size limit]" };
++      const placeholderSize = Buffer.byteLength(JSON.stringify(placeholder), "utf8") + (blocks.length > 0 ? 1 : 0);
++      if (blocksBytes + placeholderSize <= MAX_TRANSCRIPT_ENTRY_CONTENT_BYTES) blocks.push(placeholder);
++      return false;
++    }
++    blocks.push(block);
++    blocksBytes += size;
++    return true;
++  };
++
++  for (const value of values) {
++    if (!value || typeof value !== "object") continue;
++    const item = value as Record<string, unknown>;
++    if (item.type === "text" && typeof item.text === "string") {
++      const remaining = MAX_TRANSCRIPT_TEXT_BYTES - textBytes;
++      if (remaining <= 0) { truncated = true; continue; }
++      const limited = truncateUtf8(item.text, remaining);
++      textBytes += Buffer.byteLength(limited.text, "utf8");
++      if (!appendBlock({ type: "text", text: limited.text })) break;
++      truncated ||= limited.truncated;
++    } else if (item.type === "image") {
++      const mimeType = typeof item.mimeType === "string" ? item.mimeType.toLowerCase() : "";
++      const data = typeof item.data === "string" ? item.data : "";
++      const size = Buffer.byteLength(data, "utf8");
++      if (TRANSCRIPT_IMAGE_TYPES.has(mimeType) && data.length > 0 && data.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(data) && size <= MAX_TRANSCRIPT_IMAGE_BYTES - imageBytes) {
++        if (!appendBlock({ type: "image", mimeType, data })) break;
++        imageBytes += size;
++      } else {
++        if (!appendBlock({ type: "text", text: "[画像は形式またはサイズ上限により省略]" })) break;
++        truncated = true;
++      }
++    } else if (item.type === "toolCall" && typeof item.name === "string") {
++      let argumentsText = "{}";
++      try { argumentsText = JSON.stringify(item.arguments ?? {}) ?? "{}"; } catch { argumentsText = "[引数を読み取れません]"; }
++      const limited = truncateUtf8(argumentsText, MAX_TRANSCRIPT_TOOL_ARGUMENT_BYTES);
++      if (!appendBlock({
++        type: "toolCall", name: item.name.slice(0, 120),
++        ...(typeof item.id === "string" ? { id: item.id.slice(0, 128) } : {}),
++        arguments: limited.text,
++      })) break;
++      truncated ||= limited.truncated;
++    }
++  }
++  return { blocks, truncated };
++}
++
++function transcriptMessage(entry: ReturnType<ExtensionContext["sessionManager"]["buildContextEntries"]>[number], ctx?: ExtensionContext) {
++  // Context summaries can contain hidden thinking, so only export actual visible message entries.
++  if (entry.type === "custom_message") {
++    if (entry.display !== true) return null;
++    const normalized = transcriptBlocks(entry.content);
++    return {
++      id: entry.id, role: "custom", at: entry.timestamp,
++      ...(typeof entry.customType === "string" ? { label: entry.customType.slice(0, 120) } : {}),
++      content: normalized.blocks,
++      ...(normalized.truncated ? { truncated: true } : {}),
++    };
++  }
++  if (entry.type !== "message") return null;
++  const message = entry.message as Record<string, unknown>;
++  const role = message.role;
++  const assistantModel = role === "assistant" ? modelRef({ provider: message.provider, id: message.model }) : null;
++  const registeredModel = assistantModel ? ctx?.modelRegistry?.find(assistantModel.provider, assistantModel.id) : undefined;
++  if (role === "system" || role === "thinking") return null;
++  if (role === "custom" && message.display !== true) return null;
++  if (!["user", "assistant", "toolResult", "bashExecution", "custom"].includes(String(role))) return null;
++
++  let content: unknown = message.content;
++  const toolName = typeof message.toolName === "string" ? message.toolName.slice(0, 120) : undefined;
++  const isError = typeof message.isError === "boolean" ? message.isError : undefined;
++  let command: string | undefined;
++  let exitCode: number | undefined;
++  let cancelled: boolean | undefined;
++  let bashTruncated: boolean | undefined;
++  if (role === "bashExecution") {
++    command = typeof message.command === "string" ? truncateUtf8(message.command, MAX_TRANSCRIPT_TOOL_ARGUMENT_BYTES).text : "";
++    content = [{ type: "text", text: typeof message.output === "string" ? message.output : "" }];
++    exitCode = typeof message.exitCode === "number" && Number.isFinite(message.exitCode) ? message.exitCode : undefined;
++    cancelled = typeof message.cancelled === "boolean" ? message.cancelled : undefined;
++    bashTruncated = typeof message.truncated === "boolean" ? message.truncated : undefined;
++  }
++  const normalized = transcriptBlocks(content);
++  const timestamp = typeof message.timestamp === "number" && Number.isFinite(message.timestamp) && Math.abs(message.timestamp) < 8.64e15
++    ? new Date(message.timestamp).toISOString()
++    : entry.timestamp;
++  const wasTruncated = normalized.truncated || bashTruncated === true;
++  return {
++    id: entry.id, role, at: timestamp,
++    ...(role === "custom" && typeof message.customType === "string" ? { label: message.customType.slice(0, 120) } : {}),
++    ...(assistantModel ? { model: { ...assistantModel, ...(typeof registeredModel?.name === "string" ? { name: truncateUtf8(registeredModel.name, 120).text } : {}) } } : {}),
++    ...(toolName ? { toolName } : {}), ...(isError === undefined ? {} : { isError }),
++    ...(command === undefined ? {} : { command }),
++    ...(exitCode === undefined ? {} : { exitCode }),
++    ...(cancelled === undefined ? {} : { cancelled }),
++    content: normalized.blocks,
++    ...(role === "bashExecution" && bashTruncated !== undefined
++      ? { truncated: bashTruncated || normalized.truncated }
++      : wasTruncated ? { truncated: true } : {}),
++  };
++}
++
++export function readTranscript(ctx: ExtensionContext, afterEntryId: unknown) {
++  const entries = ctx.sessionManager.buildContextEntries();
++  const hasCursor = typeof afterEntryId === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(afterEntryId);
++  const cursorIndex = hasCursor ? entries.findIndex((entry) => entry.id === afterEntryId) : -1;
++  const reset = !hasCursor || cursorIndex < 0;
++  const messages: Record<string, unknown>[] = [];
++  let usedBytes = 0;
++  let truncated = false;
++  let more = false;
++  let cursor = reset ? entries.at(-1)?.id ?? null : afterEntryId;
++
++  if (reset) {
++    for (let index = entries.length - 1; index >= 0; index--) {
++      const message = transcriptMessage(entries[index], ctx);
++      if (!message) continue;
++      if (messages.length >= MAX_TRANSCRIPT_MESSAGES) { truncated = true; break; }
++      const size = Buffer.byteLength(JSON.stringify(message), "utf8");
++      if (usedBytes + size > MAX_TRANSCRIPT_BYTES) { truncated = true; break; }
++      usedBytes += size;
++      messages.push(message);
++      if (message.truncated === true) truncated = true;
++    }
++    messages.reverse();
++  } else {
++    for (let index = cursorIndex + 1; index < entries.length; index++) {
++      const message = transcriptMessage(entries[index], ctx);
++      if (message) {
++        const size = Buffer.byteLength(JSON.stringify(message), "utf8");
++        if (messages.length >= MAX_TRANSCRIPT_MESSAGES || usedBytes + size > MAX_TRANSCRIPT_BYTES) {
++          more = true;
++          break;
++        }
++        usedBytes += size;
++        messages.push(message);
++        if (message.truncated === true) truncated = true;
++      }
++      cursor = entries[index].id;
++    }
++  }
++  return { source: "pi-session", messages, cursor, reset, more, truncated };
++}
++
+@@ -36,0 +335 @@ export default function bridgeExtension(pi: ExtensionAPI) {
++  let codexUsageCache: { key: string; fetchedAt: number; value: Awaited<ReturnType<typeof readCodexUsage>> } | undefined;
+@@ -41 +340 @@ export default function bridgeExtension(pi: ExtensionAPI) {
+-    contextTokens: null as number | null, wallMs: 0,
++    contextTokens: null as number | null, contextWindow: null as number | null, contextPercent: null as number | null, wallMs: 0,
+@@ -53 +352 @@ export default function bridgeExtension(pi: ExtensionAPI) {
+-  function send(frame: Record<string, unknown>) {
++  function send(frame: Record<string, unknown>, maxBytes = MAX_LINE_BYTES) {
+@@ -55 +354 @@ export default function bridgeExtension(pi: ExtensionAPI) {
+-    if (bytes.length > MAX_LINE_BYTES) return;
++    if (bytes.length > maxBytes) return;
+@@ -66,0 +366,7 @@ export default function bridgeExtension(pi: ExtensionAPI) {
++  function updateContextTelemetry(ctx: ExtensionContext) {
++    const usage = ctx.getContextUsage();
++    telemetry.contextTokens = usage?.tokens ?? null;
++    telemetry.contextWindow = usage?.contextWindow ?? null;
++    telemetry.contextPercent = usage?.percent ?? null;
++  }
++
+@@ -88,0 +395,19 @@ export default function bridgeExtension(pi: ExtensionAPI) {
++      } else if (frame.command === "request_models" && currentContext) {
++        send({ op: "result", id, ok: true, data: readModels(currentContext) }, MAX_MODEL_LINE_BYTES);
++      } else if (frame.command === "request_codex_usage" && currentContext) {
++        const key = currentContext.model ? `${currentContext.model.provider}/${currentContext.model.id}` : "";
++        const cached = codexUsageCache;
++        if (key && cached && cached.key === key && Date.now() - cached.fetchedAt < CODEX_USAGE_CACHE_MS) {
++          send({ op: "result", id, ok: true, data: cached.value });
++        } else {
++          const value = await readCodexUsage(currentContext);
++          if (value) codexUsageCache = { key, fetchedAt: value.fetchedAt, value };
++          send({ op: "result", id, ok: true, data: value });
++        }
++      } else if (frame.command === "switch_model" && currentContext) {
++        if (typeof frame.provider !== "string" || typeof frame.modelId !== "string" || Buffer.byteLength(frame.provider, "utf8") > 120 || Buffer.byteLength(frame.modelId, "utf8") > 120) {
++          send({ op: "result", id, ok: false, error: "invalid model" });
++        } else {
++          const result = await switchAvailableModel(pi, currentContext, frame.provider, frame.modelId);
++          send({ op: "result", id, ok: true, data: result });
++        }
+@@ -90,0 +416,2 @@ export default function bridgeExtension(pi: ExtensionAPI) {
++      } else if (frame.command === "request_transcript" && currentContext) {
++        send({ op: "result", id, ok: true, data: readTranscript(currentContext, frame.afterEntryId) }, MAX_TRANSCRIPT_LINE_BYTES);
+@@ -110,0 +438 @@ export default function bridgeExtension(pi: ExtensionAPI) {
++        model: publicModel(currentContext?.model),
+@@ -149,0 +478,5 @@ export default function bridgeExtension(pi: ExtensionAPI) {
++  pi.on("model_select", (e) => {
++    if (!active) return;
++    if (currentContext) updateContextTelemetry(currentContext);
++    event("ModelChanged", { summary: "Model changed", model: publicModel(e.model), telemetry: { ...telemetry } });
++  });
+@@ -158,0 +492 @@ export default function bridgeExtension(pi: ExtensionAPI) {
++    codexUsageCache = undefined;
+@@ -220 +554 @@ export default function bridgeExtension(pi: ExtensionAPI) {
+-    telemetry.contextTokens = ctx.getContextUsage()?.tokens ?? null;
++    updateContextTelemetry(ctx);
+diff --git a/src/bridge/protocol.mjs b/src/bridge/protocol.mjs
+index e4b8b21..95dc647 100644
+--- a/src/bridge/protocol.mjs
++++ b/src/bridge/protocol.mjs
+@@ -5 +5 @@ export const VERSION = 1;
+-export const MAX_LINE_BYTES = 64 * 1024;
++export const MAX_LINE_BYTES = 8 * 1024 * 1024;
+@@ -7 +7 @@ export const COMMANDS = new Set([
+-  "send_instruction", "pause", "resume", "approve", "reject", "request_diff", "request_status", "request_task_state", "request_events",
++  "send_instruction", "pause", "resume", "approve", "reject", "request_diff", "request_status", "request_task_state", "request_events", "request_transcript", "request_models", "request_codex_usage", "switch_model",
+@@ -9 +9 @@ export const COMMANDS = new Set([
+-export const FORWARDED_COMMANDS = new Set(["send_instruction", "request_diff", "request_task_state"]);
++export const FORWARDED_COMMANDS = new Set(["send_instruction", "request_diff", "request_task_state", "request_transcript", "request_models", "request_codex_usage", "switch_model"]);
+diff --git a/src/bridge/server.mjs b/src/bridge/server.mjs
+index 9e02852..2a99e96 100644
+--- a/src/bridge/server.mjs
++++ b/src/bridge/server.mjs
+@@ -14,0 +15,7 @@ let snapshotTail = Promise.resolve();
++function modelRef(value) {
++  if (!value || typeof value !== "object") return null;
++  const { provider, id } = value;
++  if (typeof provider !== "string" || typeof id !== "string" || Buffer.byteLength(provider, "utf8") > 120 || Buffer.byteLength(id, "utf8") > 120 || /[\u0000-\u001f\u007f]/.test(provider + id)) return null;
++  return { provider, id };
++}
++
+@@ -60,0 +68 @@ function attach(socket) {
++          currentModel: modelRef(frame.model),
+@@ -78,0 +87 @@ function attach(socket) {
++        if (frame.type === "ModelChanged") session.currentModel = modelRef(frame.model);
+@@ -128,0 +138,3 @@ function attach(socket) {
++      if (frame.command === "switch_model" && (typeof frame.provider !== "string" || !frame.provider || Buffer.byteLength(frame.provider, "utf8") > 120 || typeof frame.modelId !== "string" || !frame.modelId || Buffer.byteLength(frame.modelId, "utf8") > 120 || /[\u0000-\u001f\u007f]/.test(frame.provider + frame.modelId))) {
++        reply(socket, frame.id, false, null, "invalid model"); return;
++      }
+@@ -135 +147,4 @@ function attach(socket) {
+-      writeFrame(session.socket, { op: "command", id, command: frame.command, text: frame.text });
++      writeFrame(session.socket, {
++        op: "command", id, command: frame.command, text: frame.text, afterEntryId: frame.afterEntryId,
++        provider: frame.provider, modelId: frame.modelId,
++      });
+diff --git a/test/bridge-codex-usage.test.mjs b/test/bridge-codex-usage.test.mjs
+new file mode 100644
+index 0000000..4daca17
+--- /dev/null
++++ b/test/bridge-codex-usage.test.mjs
+@@ -0,0 +1,83 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { readCodexUsage } from "../extensions/bridge.ts";
++
++function createContext(provider = "openai-codex") {
++  const claims = Buffer.from(JSON.stringify({
++    "https://api.openai.com/auth": { chatgpt_account_id: "account_123" },
++    "https://api.openai.com/profile": { email: "private@example.com" },
++  })).toString("base64url");
++  const token = `header.${claims}.signature`;
++  return {
++    model: { provider, id: "gpt-codex" },
++    token,
++    modelRegistry: {
++      calls: 0,
++      async getApiKeyAndHeaders() {
++        this.calls++;
++        return { ok: true, apiKey: token };
++      },
++    },
++  };
++}
++
++test("Codex usage reads active Pi auth and returns only quota fields", async () => {
++  const originalFetch = globalThis.fetch;
++  const context = createContext();
++  let request;
++  globalThis.fetch = async (url, options) => {
++    request = { url: String(url), options };
++    return new Response(JSON.stringify({
++      plan_type: "private-plan",
++      email: "private@example.com",
++      rate_limit: {
++        primary_window: { used_percent: 24.5, limit_window_seconds: 18000, reset_at: 1800000000 },
++        secondary_window: { used_percent: 63, limit_window_seconds: 604800, reset_at: 1800600000 },
++      },
++    }), { status: 200, headers: { "content-type": "application/json" } });
++  };
++  try {
++    const result = await readCodexUsage(context);
++    assert.equal(context.modelRegistry.calls, 1);
++    assert.equal(request.url, "https://chatgpt.com/backend-api/wham/usage");
++    assert.equal(request.options.method, "GET");
++    assert.equal(request.options.redirect, "error");
++    assert.equal(request.options.cache, "no-store");
++    assert.equal(request.options.headers.Authorization, `Bearer ${context.token}`);
++    assert.equal(request.options.headers["chatgpt-account-id"], "account_123");
++    assert.deepEqual(result.fiveHour, { usedPercent: 24.5, resetAt: 1800000000 });
++    assert.deepEqual(result.weekly, { usedPercent: 63, resetAt: 1800600000 });
++    assert.equal(JSON.stringify(result).includes(context.token), false);
++    assert.equal(JSON.stringify(result).includes("private@example.com"), false);
++    assert.equal(JSON.stringify(result).includes("private-plan"), false);
++  } finally {
++    globalThis.fetch = originalFetch;
++  }
++});
++
++test("Codex usage is not queried for a non-Codex provider", async () => {
++  const originalFetch = globalThis.fetch;
++  const context = createContext("anthropic");
++  globalThis.fetch = async () => { throw new Error("must not fetch"); };
++  try {
++    assert.equal(await readCodexUsage(context), null);
++    assert.equal(context.modelRegistry.calls, 0);
++  } finally {
++    globalThis.fetch = originalFetch;
++  }
++});
++
++test("Codex usage failures do not return upstream errors or credential text", async () => {
++  const originalFetch = globalThis.fetch;
++  const context = createContext();
++  globalThis.fetch = async () => { throw new Error(`failed with ${context.token}`); };
++  try {
++    await assert.rejects(readCodexUsage(context), (error) => {
++      assert.equal(error.message, "Codex usage unavailable");
++      assert.equal(error.message.includes(context.token), false);
++      return true;
++    });
++  } finally {
++    globalThis.fetch = originalFetch;
++  }
++});
+diff --git a/test/bridge-transcript.test.mjs b/test/bridge-transcript.test.mjs
+new file mode 100644
+index 0000000..014f977
+--- /dev/null
++++ b/test/bridge-transcript.test.mjs
+@@ -0,0 +1,185 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { readModels, readTranscript, resolveAvailableModel, switchAvailableModel } from "../extensions/bridge.ts";
++
++const timestamp = "2026-09-24T12:00:00.000Z";
++
++function context(entries, branch = entries, modelRegistry) {
++  return { sessionManager: {
++    buildContextEntries: () => entries,
++    getBranch: () => branch,
++  }, ...(modelRegistry ? { modelRegistry } : {}) };
++}
++
++test("model catalog exposes bounded safe metadata and resolves exact available models", () => {
++  const available = [
++    { provider: "anthropic", id: "claude-sonnet", name: "Claude Sonnet", reasoning: true, contextWindow: 200000, baseUrl: "https://private.invalid", headers: { Authorization: "secret" } },
++    { provider: "openai", id: "gpt-5", name: "GPT-5", reasoning: true, contextWindow: 128000 },
++  ];
++  const ctx = {
++    model: available[0],
++    modelRegistry: { getAvailable: () => available },
++  };
++  const result = readModels(ctx);
++  assert.deepEqual(result.current, { provider: "anthropic", id: "claude-sonnet", name: "Claude Sonnet", reasoning: true, contextWindow: 200000 });
++  assert.equal(result.truncated, false);
++  assert.equal(result.models.length, 2);
++  assert.equal(JSON.stringify(result).includes("private.invalid"), false);
++  assert.equal(JSON.stringify(result).includes("Authorization"), false);
++  assert.equal(resolveAvailableModel(ctx, "anthropic", "claude-sonnet"), available[0]);
++  assert.equal(resolveAvailableModel(ctx, "anthropic", "claude-sonnet/../gpt-5"), undefined);
++  assert.equal(resolveAvailableModel(ctx, "openai", "claude-sonnet"), undefined);
++  const many = { ...ctx, modelRegistry: { getAvailable: () => Array.from({ length: 201 }, (_, index) => ({ provider: "p", id: `m${index}` })) } };
++  assert.equal(readModels(many).models.length, 200);
++  assert.equal(readModels(many).truncated, true);
++});
++
++test("model switching only selects an exact available model while Pi is idle", async () => {
++  const available = [{ provider: "anthropic", id: "claude-sonnet", name: "Claude Sonnet", baseUrl: "https://private.invalid" }];
++  const ctx = { isIdle: () => true, modelRegistry: { getAvailable: () => available } };
++  const selected = [];
++  const pi = { setModel: async (model) => { selected.push(model); return true; } };
++  const result = await switchAvailableModel(pi, ctx, "anthropic", "claude-sonnet");
++  assert.deepEqual(result.current, { provider: "anthropic", id: "claude-sonnet", name: "Claude Sonnet", reasoning: false });
++  assert.equal(selected[0], available[0]);
++  await assert.rejects(switchAvailableModel(pi, ctx, "anthropic", "claude-sonnet/../../x"), /model unavailable/);
++  await assert.rejects(switchAvailableModel(pi, { ...ctx, isIdle: () => false }, "anthropic", "claude-sonnet"), /session busy/);
++  await assert.rejects(switchAvailableModel({ setModel: async () => false }, ctx, "anthropic", "claude-sonnet"), /authentication unavailable/);
++});
++
++test("transcript exports visible messages, tool calls, outputs, and safe images without hidden prompts", () => {
++  const imageData = Buffer.alloc(96 * 1024).toString("base64");
++  const entries = [
++    { id: "system_1", timestamp, type: "message", message: { role: "system", content: "private system prompt", timestamp: Date.parse(timestamp) } },
++    { id: "user_1", timestamp, type: "message", message: { role: "user", content: [{ type: "text", text: "Inspect this screenshot" }, { type: "image", mimeType: "image/png", data: imageData }], timestamp: Date.parse(timestamp) } },
++    { id: "assistant_1", timestamp, type: "message", message: { role: "assistant", provider: "anthropic", model: "claude-sonnet", content: [{ type: "thinking", thinking: "private hidden reasoning" }, { type: "text", text: "I will inspect it." }, { type: "toolCall", id: "call_1", name: "bash", arguments: { command: "pwd" } }], timestamp: Date.parse(timestamp) } },
++    { id: "tool_1", timestamp, type: "message", message: { role: "toolResult", toolCallId: "call_1", toolName: "bash", content: [{ type: "text", text: "tool output" }], isError: false, timestamp: Date.parse(timestamp) } },
++    { id: "custom_hidden", timestamp, type: "message", message: { role: "custom", customType: "internal", display: false, content: "must not appear", timestamp: Date.parse(timestamp) } },
++    { id: "custom_message_hidden", timestamp, type: "custom_message", customType: "internal-hidden", display: false, content: "hidden Pi custom message", details: { secret: "not for export" } },
++    { id: "custom_message_visible", timestamp, type: "custom_message", customType: "notice", display: true, content: "visible custom message", details: { secret: "not for export" } },
++    { id: "bash_1", timestamp, type: "message", message: { role: "bashExecution", command: "git status", output: "working tree", exitCode: 0, cancelled: false, truncated: false, fullOutputPath: "/tmp/private/full-output.log", timestamp: Date.parse(timestamp) } },
++    { id: "compact_1", timestamp, type: "compaction", summary: "Compaction summary includes hidden thoughts", firstKeptEntryId: "user_1", tokensBefore: 100 },
++    { id: "branch_summary_1", timestamp, type: "branch_summary", summary: "Branch summary includes hidden reasoning", fromId: "user_1" },
++    { id: "state_1", timestamp, type: "custom", customType: "worklist-session-snapshot", data: {} },
++  ];
++
++  const result = readTranscript(context(entries, entries, { find: () => ({ name: "Claude Sonnet", baseUrl: "https://private.invalid", headers: { Authorization: "secret" } }) }), undefined);
++  const encoded = JSON.stringify(result);
++  assert.deepEqual(result.messages.map((message) => message.role), ["user", "assistant", "toolResult", "custom", "bashExecution"]);
++  assert.equal(result.cursor, "state_1");
++  assert.equal(result.reset, true);
++  assert.equal(encoded.includes("private system prompt"), false);
++  assert.equal(encoded.includes("private hidden reasoning"), false);
++  assert.equal(encoded.includes("must not appear"), false);
++  assert.equal(encoded.includes("hidden Pi custom message"), false);
++  assert.equal(encoded.includes("Compaction summary includes hidden thoughts"), false);
++  assert.equal(encoded.includes("Branch summary includes hidden reasoning"), false);
++  assert.equal(encoded.includes("/tmp/private/full-output.log"), false);
++  assert.equal(encoded.includes("not for export"), false);
++  assert.ok(Buffer.byteLength(encoded) > 64 * 1024, "image transcript exercises the enlarged frame limit");
++  assert.equal(result.messages[0].content[1].data, imageData);
++  assert.deepEqual(result.messages[1].model, { provider: "anthropic", id: "claude-sonnet", name: "Claude Sonnet" });
++  assert.deepEqual(JSON.parse(result.messages[1].content.find((block) => block.type === "toolCall").arguments), { command: "pwd" });
++  assert.equal(result.messages[2].content[0].text, "tool output");
++  assert.equal(result.messages[3].label, "notice");
++  assert.equal(result.messages[3].content[0].text, "visible custom message");
++  assert.equal(result.messages[4].command, "git status");
++  assert.equal(result.messages[4].exitCode, 0);
++  assert.equal(result.messages[4].cancelled, false);
++  assert.equal(result.messages[4].truncated, false);
++});
++
++test("transcript deltas advance by active-branch entry and reset for stale cursors", () => {
++  const entries = [
++    { id: "user_1", timestamp, type: "message", message: { role: "user", content: "first", timestamp: Date.parse(timestamp) } },
++    { id: "state_1", timestamp, type: "custom", customType: "extension-state", data: {} },
++    { id: "assistant_1", timestamp, type: "message", message: { role: "assistant", content: [{ type: "text", text: "second" }], timestamp: Date.parse(timestamp) } },
++  ];
++  const delta = readTranscript(context(entries), "user_1");
++  assert.equal(delta.reset, false);
++  assert.equal(delta.cursor, "assistant_1");
++  assert.deepEqual(delta.messages.map((message) => message.id), ["assistant_1"]);
++
++  const reset = readTranscript(context(entries), "old_branch_entry");
++  assert.equal(reset.reset, true);
++  assert.deepEqual(reset.messages.map((message) => message.id), ["user_1", "assistant_1"]);
++});
++
++test("transcript uses compaction-aware context entries and excludes summaries", () => {
++  const contextEntries = [
++    { id: "compaction_1", timestamp, type: "compaction", summary: "summary may contain hidden reasoning", firstKeptEntryId: "kept_user", tokensBefore: 100 },
++    { id: "kept_user", timestamp, type: "message", message: { role: "user", content: "kept conversation", timestamp: Date.parse(timestamp) } },
++    { id: "branch_summary_1", timestamp, type: "branch_summary", summary: "branch summary may contain hidden reasoning", fromId: "kept_user" },
++    { id: "kept_assistant", timestamp, type: "message", message: { role: "assistant", content: "kept answer", timestamp: Date.parse(timestamp) } },
++  ];
++  const fullBranch = [
++    { id: "superseded_user", timestamp, type: "message", message: { role: "user", content: "superseded before compaction", timestamp: Date.parse(timestamp) } },
++    ...contextEntries,
++  ];
++  const sessionContext = context(contextEntries, fullBranch);
++  const result = readTranscript(sessionContext, undefined);
++  const encoded = JSON.stringify(result);
++  assert.deepEqual(result.messages.map((message) => message.id), ["kept_user", "kept_assistant"]);
++  assert.equal(encoded.includes("superseded before compaction"), false);
++  assert.equal(encoded.includes("summary may contain hidden reasoning"), false);
++  assert.equal(encoded.includes("branch summary may contain hidden reasoning"), false);
++
++  const delta = readTranscript(sessionContext, "kept_user");
++  assert.equal(delta.reset, false);
++  assert.equal(delta.cursor, "kept_assistant");
++  assert.deepEqual(delta.messages.map((message) => message.id), ["kept_assistant"]);
++  const staleCursor = readTranscript(sessionContext, "superseded_user");
++  assert.equal(staleCursor.reset, true);
++  assert.deepEqual(staleCursor.messages.map((message) => message.id), ["kept_user", "kept_assistant"]);
++});
++
++test("initial transcript snapshots bound the result and prefer the most recent entries", () => {
++  const entries = Array.from({ length: 85 }, (_, index) => ({
++    id: `msg_${index}`,
++    timestamp,
++    type: "message",
++    message: { role: index % 2 === 0 ? "user" : "assistant", content: `message ${index}`, timestamp: Date.parse(timestamp) + index },
++  }));
++  const result = readTranscript(context(entries), undefined);
++  assert.equal(result.messages.length, 80);
++  assert.equal(result.messages[0].id, "msg_5");
++  assert.equal(result.messages.at(-1).id, "msg_84");
++  assert.equal(result.truncated, true);
++  assert.equal(result.cursor, "msg_84");
++});
++
++test("a huge single delta entry is truncated and advances the active-context cursor", () => {
++  const toolCalls = Array.from({ length: 120 }, (_, index) => ({
++    type: "toolCall",
++    id: `call_${index}`,
++    name: "oversized-tool",
++    arguments: { value: "x".repeat(60 * 1024) },
++  }));
++  const entries = [
++    { id: "delta_start", timestamp, type: "message", message: { role: "user", content: "start", timestamp: Date.parse(timestamp) } },
++    { id: "huge_delta", timestamp, type: "message", message: { role: "assistant", content: toolCalls, timestamp: Date.parse(timestamp) } },
++  ];
++
++  const delta = readTranscript(context(entries), "delta_start");
++  assert.equal(delta.reset, false);
++  assert.equal(delta.cursor, "huge_delta");
++  assert.equal(delta.more, false);
++  assert.equal(delta.truncated, true);
++  assert.deepEqual(delta.messages.map((message) => message.id), ["huge_delta"]);
++  assert.ok(Buffer.byteLength(JSON.stringify(delta.messages[0]), "utf8") <= 3 * 1024 * 1024);
++});
++
++test("bash execution exports safe status fields but never its full output path", () => {
++  const entries = [
++    { id: "bash_failed", timestamp, type: "message", message: { role: "bashExecution", command: "false", output: "failed", exitCode: 7, cancelled: false, truncated: false, fullOutputPath: "/private/nonzero.log", timestamp: Date.parse(timestamp) } },
++    { id: "bash_cancelled", timestamp, type: "message", message: { role: "bashExecution", command: "sleep 10", output: "", exitCode: undefined, cancelled: true, truncated: false, fullOutputPath: "/private/cancelled.log", timestamp: Date.parse(timestamp) + 1 } },
++    { id: "bash_truncated", timestamp, type: "message", message: { role: "bashExecution", command: "large-output", output: "partial output", exitCode: 0, cancelled: false, truncated: true, fullOutputPath: "/private/truncated.log", timestamp: Date.parse(timestamp) + 2 } },
++  ];
++  const result = readTranscript(context(entries), undefined);
++  assert.deepEqual(result.messages.map(({ exitCode, cancelled, truncated }) => ({ exitCode, cancelled, truncated })), [
++    { exitCode: 7, cancelled: false, truncated: false },
++    { exitCode: undefined, cancelled: true, truncated: false },
++    { exitCode: 0, cancelled: false, truncated: true },
++  ]);
++  assert.equal(JSON.stringify(result).includes("/private/"), false);
++});
+diff --git a/test/bridge.test.mjs b/test/bridge.test.mjs
+index 8dbfbff..50c0106 100644
+--- a/test/bridge.test.mjs
++++ b/test/bridge.test.mjs
+@@ -32 +32 @@ test("bridge registers a session, logs events, and forwards allowed commands", a
+-      profile: "build", variant: "baseline", caseId: "case-1", baseCommit: "a".repeat(40) });
++      profile: "build", variant: "baseline", caseId: "case-1", baseCommit: "a".repeat(40), model: { provider: "anthropic", id: "claude-sonnet" } });
+@@ -43,0 +44 @@ test("bridge registers a session, logs events, and forwards allowed commands", a
++    assert.deepEqual(status.data.currentModel, { provider: "anthropic", id: "claude-sonnet" });
+@@ -61,0 +63,37 @@ test("bridge registers a session, logs events, and forwards allowed commands", a
++    const transcript = protocol.request({ id: "transcript", command: "request_transcript", sessionId: "session_1", afterEntryId: "entry_1" });
++    await waitFor(() => frames.some((x) => x.op === "command" && x.command === "request_transcript"));
++    const transcriptCommand = frames.find((x) => x.op === "command" && x.command === "request_transcript");
++    assert.equal(transcriptCommand.afterEntryId, "entry_1");
++    const largeImage = "A".repeat(96 * 1024);
++    protocol.writeFrame(agent, { op: "result", id: transcriptCommand.id, ok: true, data: { source: "pi-session", messages: [{ id: "m1", role: "assistant", at: "2026-09-24T12:00:00Z", content: [{ type: "text", text: "private transcript text" }, { type: "image", mimeType: "image/png", data: largeImage }] }] } });
++    const transcriptResponse = await transcript;
++    assert.equal(transcriptResponse.data.messages[0].content[0].text, "private transcript text");
++    assert.equal(transcriptResponse.data.messages[0].content[1].data.length, largeImage.length);
++
++    const models = protocol.request({ id: "models", command: "request_models", sessionId: "session_1" });
++    await waitFor(() => frames.some((x) => x.op === "command" && x.command === "request_models"));
++    const modelsCommand = frames.find((x) => x.op === "command" && x.command === "request_models");
++    protocol.writeFrame(agent, { op: "result", id: modelsCommand.id, ok: true, data: { current: { provider: "anthropic", id: "claude-sonnet" }, models: [{ provider: "anthropic", id: "claude-sonnet" }] } });
++    assert.equal((await models).data.models[0].id, "claude-sonnet");
++
++    const codexUsage = protocol.request({ id: "codex-usage", command: "request_codex_usage", sessionId: "session_1" });
++    await waitFor(() => frames.some((x) => x.op === "command" && x.command === "request_codex_usage"));
++    const usageCommand = frames.find((x) => x.op === "command" && x.command === "request_codex_usage");
++    assert.deepEqual(Object.keys(usageCommand).sort(), ["command", "id", "op", "v"]);
++    protocol.writeFrame(agent, { op: "result", id: usageCommand.id, ok: true, data: { fiveHour: { usedPercent: 25 }, weekly: { usedPercent: 60 }, fetchedAt: Date.now() } });
++    assert.equal((await codexUsage).data.weekly.usedPercent, 60);
++
++    const switchModel = protocol.request({ id: "switch", command: "switch_model", sessionId: "session_1", provider: "anthropic", modelId: "claude-opus" });
++    await waitFor(() => frames.some((x) => x.op === "command" && x.command === "switch_model"));
++    const switchCommand = frames.find((x) => x.op === "command" && x.command === "switch_model");
++    assert.equal(switchCommand.provider, "anthropic");
++    assert.equal(switchCommand.modelId, "claude-opus");
++    protocol.writeFrame(agent, { op: "result", id: switchCommand.id, ok: true, data: { current: { provider: "anthropic", id: "claude-opus" } } });
++    assert.equal((await switchModel).data.current.id, "claude-opus");
++    protocol.writeFrame(agent, { op: "event", sessionId: "session_1", type: "ModelChanged", model: { provider: "anthropic", id: "claude-opus", name: "Claude Opus", baseUrl: "must not be stored" } });
++    await waitFor(async () => (await protocol.request({ id: "model-changed", command: "request_status", sessionId: "session_1" })).data.eventSeq === 4);
++    const switchedStatus = await protocol.request({ id: "switched-status", command: "request_status", sessionId: "session_1" });
++    assert.deepEqual(switchedStatus.data.currentModel, { provider: "anthropic", id: "claude-opus" });
++
++    const eventLog = await readFile(join(dir, "state", "session_1.jsonl"), "utf8");
++    assert.equal(eventLog.includes("private transcript text"), false);

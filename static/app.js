@@ -2,8 +2,10 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const state = {
   sessions: [], selectedId: null, connected: false,
   events: new Map(), cursors: new Map(), sentMessages: new Map(), transcripts: new Map(), transcriptCursors: new Map(), detailRefreshes: new Map(),
-  transcriptEnabled: true, transcriptLoadingFor: null, transcriptRequest: null, refreshAfterResume: false,
-  tasks: new Map(), diffs: new Map(), stream: null, liveConnected: false, toastTimer: null, refreshTimer: null,
+  drafts: new Map(), scrollPositions: new Map(),
+  transcriptEnabled: true, transcriptLoadingFor: null, transcriptRequest: null,
+  tasks: new Map(), diffs: new Map(), models: new Map(), codexUsage: new Map(), loadingCodexUsage: new Set(), loadingModels: new Set(), modelSwitching: false,
+  stream: null, liveConnected: false, toastTimer: null, detailRefreshAgain: new Set(),
   sessionSignature: "",
 };
 const MAX_TRANSCRIPT_MESSAGES = 200;
@@ -17,13 +19,14 @@ const composer = $("#instruction-text");
 const sessionInfo = $("#session-info");
 
 const eventTitles = {
-  SessionStarted: "Pi に接続しました",
-  TaskStarted: "実行を開始しました",
-  ToolStarted: "ツールを実行中です",
-  ToolFinished: "ツールの実行が終わりました",
-  TaskUpdated: "進捗を更新しました",
-  VerificationFailed: "検証で問題を検出しました",
-  SessionCompleted: "セッションを終了しました",
+  SessionStarted: "接続",
+  TaskStarted: "開始",
+  ToolStarted: "ツール開始",
+  ToolFinished: "ツール完了",
+  TaskUpdated: "更新",
+  VerificationFailed: "検証",
+  SessionCompleted: "終了",
+  ModelChanged: "モデル切替",
 };
 
 function text(value, fallback = "—") {
@@ -62,6 +65,10 @@ function formatCount(value) {
 }
 function formatCost(value) {
   return Number.isFinite(Number(value)) ? `$${Number(value).toFixed(3)}` : "—";
+}
+function formatCompactCount(value) {
+  if (!Number.isFinite(Number(value)) || Number(value) < 0) return "—";
+  return new Intl.NumberFormat("ja-JP", { notation: "compact", maximumFractionDigits: 1 }).format(Number(value));
 }
 function taskStatusLabel(status) {
   return ({ todo: "未着手", doing: "進行中", done: "完了" })[status] || status;
@@ -118,7 +125,10 @@ function setConnection(connected) {
   state.connected = connected;
   const indicator = $("#connection-state");
   indicator.dataset.state = connected ? "online" : "offline";
-  indicator.lastElementChild.textContent = connected ? "bridge 接続中" : "bridge 切断中";
+  const label = connected ? "接続" : "切断";
+  indicator.lastElementChild.textContent = label;
+  indicator.setAttribute("aria-label", label);
+  indicator.title = label;
 }
 
 function renderSessionList() {
@@ -157,63 +167,124 @@ function renderSessionList() {
   }
 }
 
+function currentModelFor(session) {
+  const ref = session?.currentModel || state.models.get(session?.sessionId)?.current;
+  if (!ref || typeof ref.provider !== "string" || typeof ref.id !== "string") return null;
+  const catalog = state.models.get(session.sessionId);
+  return catalog?.models?.find((item) => item.provider === ref.provider && item.id === ref.id) || ref;
+}
+
+function isCodexProvider(provider) {
+  return provider === "openai-codex" || /^openai-codex-[0-9]+$/.test(provider || "");
+}
+
+function formatResetTime(value) {
+  if (!Number.isSafeInteger(value) || value <= 0) return "";
+  const date = new Date(value * 1000);
+  if (Number.isNaN(date.getTime())) return "";
+  return new Intl.DateTimeFormat("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(date);
+}
+
+function updateCodexUsage(session) {
+  const section = $("#codex-usage-section");
+  const button = $("#codex-usage-refresh");
+  const model = currentModelFor(session);
+  const supported = isCodexProvider(model?.provider);
+  section.hidden = !supported;
+  const loading = Boolean(session && state.loadingCodexUsage.has(session.sessionId));
+  button.disabled = !session?.connected || !supported || loading;
+  button.textContent = loading ? "取得中" : state.codexUsage.has(session?.sessionId) ? "更新" : "取得";
+  const snapshot = session ? state.codexUsage.get(session.sessionId) : null;
+  for (const [label, prefix] of [["5h", "codex-5h"], ["7d", "codex-7d"]]) {
+    const window = snapshot?.[label === "5h" ? "fiveHour" : "weekly"];
+    const percent = Number.isFinite(window?.usedPercent) ? Math.max(0, Math.min(100, window.usedPercent)) : null;
+    const track = $(`#${prefix}-track`);
+    $(`#${prefix}-fill`).style.width = percent === null ? "0%" : `${percent}%`;
+    $(`#${prefix}-value`).textContent = percent === null ? "—" : `${Math.round(percent)}%`;
+    if (percent === null) track.removeAttribute("aria-valuenow");
+    else track.setAttribute("aria-valuenow", String(Math.round(percent)));
+    $(`#${prefix}-reset`).textContent = formatResetTime(window?.resetAt);
+  }
+}
+
+function updateUsage(session) {
+  const telemetry = session?.telemetry || {};
+  const context = Number.isFinite(telemetry.contextTokens) ? telemetry.contextTokens : null;
+  const windowSize = Number.isFinite(telemetry.contextWindow) ? telemetry.contextWindow : null;
+  const percent = Number.isFinite(telemetry.contextPercent)
+    ? Math.max(0, Math.min(100, telemetry.contextPercent))
+    : context !== null && windowSize > 0 ? Math.max(0, Math.min(100, context / windowSize * 100)) : null;
+  $("#context-value").textContent = context !== null
+    ? `${formatCompactCount(context)}${windowSize ? ` / ${formatCompactCount(windowSize)}` : ""}`
+    : "—";
+  $("#context-percent").textContent = percent !== null ? `${Math.round(percent)}%` : "";
+  $("#context-fill").style.width = percent !== null ? `${percent}%` : "0%";
+  const input = [telemetry.inputTokens, telemetry.subagentInputTokens, telemetry.externalInputTokens]
+    .reduce((sum, value) => sum + (Number.isFinite(value) && value > 0 ? value : 0), 0);
+  const output = [telemetry.outputTokens, telemetry.subagentOutputTokens, telemetry.externalOutputTokens]
+    .reduce((sum, value) => sum + (Number.isFinite(value) && value > 0 ? value : 0), 0);
+  const total = input + output;
+  $("#token-value").textContent = total > 0 ? `Tokens ${formatCompactCount(total)}` : "Tokens —";
+}
+
 function updateHeader(session) {
   const name = $("#current-name");
   const path = $("#current-path");
   const badge = $("#session-status");
+  const modelButton = $("#model-button");
   if (!session) {
-    name.textContent = "セッションを選択";
-    path.textContent = "Pi の作業状況をここに表示します";
+    name.textContent = "セッション";
+    path.textContent = "";
     if (badge) badge.hidden = true;
+    modelButton.textContent = "モデル";
+    modelButton.disabled = true;
     composer.disabled = true;
-    composer.placeholder = "Pi セッションを選ぶと指示を送れます";
+    composer.placeholder = "メッセージ";
     $("#send-button").disabled = true;
-    $("#composer-hint").textContent = "Pi セッションを選ぶと指示を送れます。";
+    $("#composer-hint").textContent = "追送";
     $("#diff-button").disabled = true;
+    $("#info-path").textContent = "";
+    $("#metric-tools").textContent = "—";
+    $("#metric-runs").textContent = "—";
+    $("#metric-cost").textContent = "—";
+    updateUsage(null);
+    updateCodexUsage(null);
     updateTranscriptControl();
     return;
   }
   name.textContent = text(session.name, shortPath(session.cwd));
-  path.textContent = text(session.cwd, "作業ディレクトリなし");
+  path.textContent = text(session.cwd, "");
   if (badge) {
     const status = statusFor(session);
     badge.hidden = false;
     badge.dataset.status = status;
     badge.textContent = statusLabel(status);
   }
+  const model = currentModelFor(session);
+  modelButton.textContent = model ? text(model.name, `${model.provider}/${model.id}`) : "モデル";
+  modelButton.disabled = !session.connected || statusFor(session) === "working" || state.modelSwitching;
   composer.disabled = !session.connected;
-  composer.placeholder = session.connected ? "続けてほしい作業や、確認してほしい点を書く" : "Pi が接続すると指示を送れます";
+  composer.placeholder = "メッセージ";
   $("#send-button").disabled = !session.connected;
-  $("#composer-hint").textContent = session.connected ? "指示は Pi への follow-up として送信します。" : "このセッションは切断中です。";
+  $("#composer-hint").textContent = session.connected ? "追送" : "切断中";
   $("#diff-button").disabled = !session.connected;
-  $("#info-path").textContent = text(session.cwd, "作業ディレクトリなし");
+  $("#info-path").textContent = text(session.cwd, "");
   const telemetry = session.telemetry || {};
   $("#metric-tools").textContent = formatCount(telemetry.toolCalls);
   $("#metric-runs").textContent = formatCount(telemetry.runs);
   $("#metric-cost").textContent = formatCost(telemetry.mainModelCostUsd);
+  updateUsage(session);
+  updateCodexUsage(session);
   updateTranscriptControl();
 }
 
 function updateTranscriptControl() {
   const button = $("#transcript-toggle");
-  const notice = $("#transcript-notice");
   const session = state.sessions.find((item) => item.sessionId === state.selectedId);
-  const loading = state.transcriptLoadingFor === state.selectedId;
   button.disabled = !session?.connected && !state.transcriptEnabled;
   button.setAttribute("aria-pressed", String(state.transcriptEnabled));
-  button.textContent = state.transcriptEnabled ? "会話を隠す" : "会話を表示";
-  if (!session) {
-    notice.textContent = "会話本文・ツール情報・画像は既定で同期します。表示するセッションを選んでください。";
-  } else if (state.transcriptEnabled) {
-    const snapshot = state.transcripts.get(state.selectedId);
-    notice.textContent = snapshot?.truncated
-      ? "会話本文・ツール呼び出し／出力・画像を同期中です。一部を省略し、直近の内容を表示しています（ブラウザ／bridge の表示上限）。system prompt・thinking は除外し、本文はサーバーに保存しません。"
-      : loading
-        ? "会話本文・ツール呼び出し／出力・画像をこのブラウザへ同期中です。「会話を隠す」で取得を中止できます。system prompt・thinking は除外し、本文はサーバーに保存しません。"
-        : "会話本文・ツール呼び出し／出力・画像をこのブラウザへ同期中です。system prompt・thinking は除外し、会話本文はサーバーに保存しません。画面にアクセスできる人は会話を閲覧できます。";
-  } else {
-    notice.textContent = "会話本文の同期を停止中です。再開すると選択中の Pi から、本文・ツール呼び出し／出力・画像をこのブラウザへ取得します。";
-  }
+  button.textContent = state.transcriptEnabled ? "隠す" : "表示";
+  button.title = state.transcriptEnabled ? "会話を隠す" : "会話を表示";
 }
 
 function toggleDrawer(open) {
@@ -233,21 +304,18 @@ function showEmptyThread(hasSession) {
   avatar.textContent = "π";
   const heading = document.createElement("h2");
   const loading = state.transcriptLoadingFor === state.selectedId;
-  heading.textContent = loading ? "会話を読み込んでいます" : hasSession ? "まだ会話はありません" : "Pi と作業を続ける";
-  const description = document.createElement("p");
-  description.textContent = hasSession
-    ? loading ? "Pi から直近の会話を受信しています。" : "Pi が作業を始めると、ここに会話と作業イベントが表示されます。"
-    : "セッションを選ぶと、会話と作業イベントがここに並びます。";
-  empty.append(avatar, heading, description);
+  heading.textContent = loading ? "読込中" : hasSession ? "会話なし" : "Pi";
+  empty.append(avatar, heading);
   messageList.append(empty);
 }
 
 function eventSummary(item) {
   const summary = text(item.summary, "イベントを受信しました。");
-  if (summary === "Pi run started") return "Pi が作業を開始しました。";
-  if (summary === "Pi run settled") return "Pi の実行が完了しました。";
-  if (summary === "Subagent settled") return "サブエージェントの処理が完了しました。";
-  if (summary.startsWith("External model cost: ")) return `外部モデルの費用を記録しました。${summary.slice("External model cost: ".length)}`;
+  if (summary === "Pi run started") return "開始";
+  if (summary === "Pi run settled") return "完了";
+  if (summary === "Subagent settled") return "サブエージェント完了";
+  if (summary === "Model changed") return "モデルを切替";
+  if (summary.startsWith("External model cost: ")) return `外部費用 · ${summary.slice("External model cost: ".length)}`;
   return summary;
 }
 
@@ -267,7 +335,7 @@ function makePiMessage(item) {
   const meta = document.createElement("div");
   meta.className = "message-meta";
   const sender = document.createElement("strong");
-  sender.textContent = "Pi の作業ログ";
+  sender.textContent = "Pi";
   const time = document.createElement("time");
   time.textContent = formatTime(item.at);
   if (item.at) time.dateTime = item.at;
@@ -357,10 +425,21 @@ function makeAssistantMessage(item) {
   meta.className = "message-meta";
   const sender = document.createElement("strong");
   sender.textContent = "Pi";
+  const messageModel = item.model;
+  if (messageModel && typeof messageModel.provider === "string" && typeof messageModel.id === "string") {
+    const catalogModel = state.models.get(state.selectedId)?.models?.find((model) => model.provider === messageModel.provider && model.id === messageModel.id);
+    const model = document.createElement("span");
+    model.className = "message-model";
+    model.textContent = catalogModel?.name || messageModel.name || messageModel.id;
+    model.title = `${messageModel.provider}/${messageModel.id}`;
+    meta.append(sender, model);
+  } else {
+    meta.append(sender);
+  }
   const time = document.createElement("time");
   time.textContent = formatTime(item.at);
   if (item.at) time.dateTime = item.at;
-  meta.append(sender, time);
+  meta.append(time);
   const bubble = document.createElement("div");
   bubble.className = "message-bubble pi-bubble";
   appendTranscriptBlocks(bubble, item.content);
@@ -374,9 +453,9 @@ function bashExecutionStatus(item) {
   const cancelled = typeof item.cancelled === "boolean" ? item.cancelled : typeof item.canceled === "boolean" ? item.canceled : null;
   const truncated = typeof item.truncated === "boolean" ? item.truncated : typeof item.outputTruncated === "boolean" ? item.outputTruncated : null;
   const labels = [];
-  if (exitCode !== null) labels.push(`終了コード ${exitCode}`);
-  if (cancelled !== null) labels.push(cancelled ? "キャンセルされました" : "キャンセルなし");
-  if (truncated !== null) labels.push(truncated ? "出力の一部を省略しました" : "出力の省略なし");
+  if (exitCode !== null) labels.push(`code ${exitCode}`);
+  if (cancelled === true) labels.push("中断");
+  if (truncated === true) labels.push("省略");
   return { labels, warning: cancelled === true || (exitCode !== null && exitCode !== 0) };
 }
 
@@ -451,6 +530,21 @@ function makeSummaryMessage(item) {
   return row;
 }
 
+function updateJumpButton() {
+  const awayFromLatest = messageList.scrollHeight - messageList.clientHeight - messageList.scrollTop > 120;
+  $("#jump-latest").hidden = !state.selectedId || !awayFromLatest;
+}
+
+function restoreSessionScroll(sessionId) {
+  const position = state.scrollPositions.get(sessionId);
+  if (!Number.isFinite(position)) return;
+  requestAnimationFrame(() => {
+    if (state.selectedId !== sessionId) return;
+    messageList.scrollTop = Math.max(0, Math.min(position, messageList.scrollHeight - messageList.clientHeight));
+    updateJumpButton();
+  });
+}
+
 function renderMessages(scrollToBottom = false) {
   const wasNearBottom = messageList.scrollHeight - messageList.clientHeight - messageList.scrollTop < 90;
   messageList.replaceChildren();
@@ -467,6 +561,7 @@ function renderMessages(scrollToBottom = false) {
 
   if (!messages.length) {
     showEmptyThread(Boolean(session));
+    updateJumpButton();
     return;
   }
   for (const item of messages) {
@@ -477,6 +572,8 @@ function renderMessages(scrollToBottom = false) {
     else messageList.append(makePiMessage(item));
   }
   if (scrollToBottom || wasNearBottom) messageList.scrollTop = messageList.scrollHeight;
+  if (state.selectedId) state.scrollPositions.set(state.selectedId, messageList.scrollTop);
+  updateJumpButton();
 }
 
 function renderTasks() {
@@ -546,39 +643,75 @@ function cancelAllDetailRefreshes() {
   for (const sessionId of state.detailRefreshes.keys()) cancelDetailRefresh(sessionId);
 }
 
+function resizeComposer() {
+  composer.style.height = "auto";
+  composer.style.height = `${Math.min(composer.scrollHeight, 176)}px`;
+}
+
 async function selectSession(sessionId) {
   if (state.selectedId === sessionId) {
     toggleDrawer(false);
     return;
+  }
+  if (state.selectedId) {
+    state.drafts.set(state.selectedId, composer.value);
+    state.scrollPositions.set(state.selectedId, messageList.scrollTop);
   }
   cancelDetailRefresh(state.selectedId);
   cancelTranscriptRequest();
   state.transcripts.clear();
   state.transcriptCursors.clear();
   state.selectedId = sessionId;
+  composer.value = state.drafts.get(sessionId) || "";
+  resizeComposer();
   updateTranscriptControl();
   toggleDrawer(false);
   renderSessionList();
   updateHeader(state.sessions.find((item) => item.sessionId === sessionId));
   renderMessages(true);
-  await refreshDetails(true);
+  restoreSessionScroll(sessionId);
+  await Promise.all([refreshDetails(true), loadModels(sessionId)]);
+}
+
+async function loadModels(sessionId) {
+  const session = state.sessions.find((item) => item.sessionId === sessionId);
+  if (!session?.connected || state.loadingModels.has(sessionId) || state.models.has(sessionId)) return;
+  state.loadingModels.add(sessionId);
+  try {
+    const catalog = await api(`/api/sessions/${encodeURIComponent(sessionId)}/models`);
+    state.models.set(sessionId, catalog);
+  } catch (error) {
+    state.models.set(sessionId, { current: null, models: [], error: error.message });
+  } finally {
+    state.loadingModels.delete(sessionId);
+    if (state.selectedId === sessionId) updateHeader(state.sessions.find((item) => item.sessionId === sessionId));
+  }
 }
 
 async function refreshDetails(reset = false) {
   const sessionId = state.selectedId;
-  if (!sessionId || state.detailRefreshes.has(sessionId)) return;
+  if (!sessionId) return;
+  if (state.detailRefreshes.has(sessionId)) {
+    state.detailRefreshAgain.add(sessionId);
+    return;
+  }
   const controller = new AbortController();
   state.detailRefreshes.set(sessionId, controller);
   try {
     await refreshDetailsForSession(sessionId, reset, controller.signal);
   } finally {
     if (state.detailRefreshes.get(sessionId) === controller) state.detailRefreshes.delete(sessionId);
+    if (state.detailRefreshAgain.delete(sessionId) && state.selectedId === sessionId && state.liveConnected) {
+      queueMicrotask(() => void refreshDetails(false));
+    }
   }
 }
 
 async function refreshDetailsForSession(sessionId, reset, signal) {
   const session = state.sessions.find((item) => item.sessionId === sessionId);
   if (!session) return;
+  let receivedEvents = [];
+  let transcriptReset = reset;
   if (reset) {
     state.events.set(sessionId, []);
     state.cursors.set(sessionId, 0);
@@ -586,7 +719,7 @@ async function refreshDetailsForSession(sessionId, reset, signal) {
     state.diffs.delete(sessionId);
     renderMessages();
     renderTasks();
-    $("#diff-summary").textContent = "必要なときに取得します。";
+    $("#diff-summary").textContent = "—";
   }
 
   const after = state.cursors.get(sessionId) || 0;
@@ -595,8 +728,9 @@ async function refreshDetailsForSession(sessionId, reset, signal) {
     const previous = state.events.get(sessionId) || [];
     if (result.dropped) {
       state.events.set(sessionId, []);
-      showToast("古いイベントは bridge の保持範囲外です。取得できた分を表示します。");
+      transcriptReset = true;
     }
+    receivedEvents = Array.isArray(result.events) ? result.events : [];
     const base = state.events.get(sessionId) || previous;
     const merged = [...base, ...(result.events || [])];
     const unique = new Map(merged.map((item) => [item.seq, item]));
@@ -604,6 +738,9 @@ async function refreshDetailsForSession(sessionId, reset, signal) {
     const changed = next.length !== previous.length || result.dropped;
     state.events.set(sessionId, next);
     state.cursors.set(sessionId, Number.isSafeInteger(result.cursor) ? result.cursor : after);
+    if (Number.isSafeInteger(session.eventSeq) && Number.isSafeInteger(result.cursor) && result.cursor < session.eventSeq) {
+      state.detailRefreshAgain.add(sessionId);
+    }
     if (changed && state.selectedId === sessionId) renderMessages();
   } catch (error) {
     if (signal.aborted) return;
@@ -615,16 +752,19 @@ async function refreshDetailsForSession(sessionId, reset, signal) {
     renderTasks();
     return;
   }
-  try {
-    const tasks = await api(`/api/sessions/${encodeURIComponent(sessionId)}/tasks`, { signal });
-    state.tasks.set(sessionId, tasks);
-    if (state.selectedId === sessionId) renderTasks();
-  } catch (error) {
-    if (signal.aborted) return;
-    if (reset && state.selectedId === sessionId) showToast(error.message, "error");
+  const taskChanged = reset || receivedEvents.some((item) => item.type === "TaskStarted" || item.type === "TaskUpdated");
+  if (taskChanged) {
+    try {
+      const tasks = await api(`/api/sessions/${encodeURIComponent(sessionId)}/tasks`, { signal });
+      state.tasks.set(sessionId, tasks);
+      if (state.selectedId === sessionId) renderTasks();
+    } catch (error) {
+      if (signal.aborted) return;
+      if (reset && state.selectedId === sessionId) showToast(error.message, "error");
+    }
   }
   if (signal.aborted) return;
-  if (state.transcriptEnabled && state.selectedId === sessionId) void refreshTranscript(reset);
+  if (state.transcriptEnabled && state.selectedId === sessionId && (reset || receivedEvents.length > 0)) void refreshTranscript(transcriptReset);
 }
 
 async function refreshTranscript(notifyError = false) {
@@ -702,6 +842,84 @@ async function toggleTranscript() {
   await refreshTranscript(true);
 }
 
+function renderModelList() {
+  const list = $("#model-list");
+  const empty = $("#model-empty");
+  const session = state.sessions.find((item) => item.sessionId === state.selectedId);
+  const catalog = session ? state.models.get(session.sessionId) : null;
+  const query = $("#model-search").value.trim().toLocaleLowerCase();
+  const models = (catalog?.models || []).filter((model) => `${model.provider} ${model.id} ${model.name || ""}`.toLocaleLowerCase().includes(query));
+  list.replaceChildren();
+  empty.hidden = models.length > 0;
+  empty.textContent = catalog?.error
+    ? /unknown command|unsupported command|not implemented/i.test(catalog.error) ? "bridge更新が必要" : "取得できません"
+    : state.loadingModels.has(session?.sessionId) ? "読込中" : "モデルなし";
+  const current = session?.currentModel || catalog?.current;
+  for (const model of models) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "model-option";
+    button.setAttribute("role", "option");
+    const selected = current?.provider === model.provider && current?.id === model.id;
+    button.setAttribute("aria-selected", String(selected));
+    const title = document.createElement("strong");
+    title.textContent = text(model.name, model.id);
+    const provider = document.createElement("span");
+    provider.textContent = model.provider;
+    button.append(title, provider);
+    button.addEventListener("click", () => void switchModel(model));
+    list.append(button);
+  }
+}
+
+async function openModelDialog() {
+  const session = state.sessions.find((item) => item.sessionId === state.selectedId);
+  if (!session?.connected || statusFor(session) === "working") return;
+  await loadModels(session.sessionId);
+  $("#model-search").value = "";
+  renderModelList();
+  $("#model-dialog").showModal();
+  $("#model-search").focus();
+}
+
+async function switchModel(model) {
+  const session = state.sessions.find((item) => item.sessionId === state.selectedId);
+  if (!session?.connected || state.modelSwitching) return;
+  state.modelSwitching = true;
+  updateHeader(session);
+  try {
+    const result = await api(`/api/sessions/${encodeURIComponent(session.sessionId)}/model`, {
+      method: "POST", body: JSON.stringify({ provider: model.provider, modelId: model.id }),
+    });
+    session.currentModel = result.current;
+    const catalog = state.models.get(session.sessionId) || { models: [] };
+    state.models.set(session.sessionId, { ...catalog, current: result.current });
+    $("#model-dialog").close();
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    state.modelSwitching = false;
+    updateHeader(state.sessions.find((item) => item.sessionId === session.sessionId));
+  }
+}
+
+async function loadCodexUsage() {
+  const session = state.sessions.find((item) => item.sessionId === state.selectedId);
+  if (!session?.connected || !isCodexProvider(currentModelFor(session)?.provider) || state.loadingCodexUsage.has(session.sessionId)) return;
+  state.loadingCodexUsage.add(session.sessionId);
+  updateCodexUsage(session);
+  try {
+    const result = await api(`/api/sessions/${encodeURIComponent(session.sessionId)}/codex-usage`);
+    if (!result || typeof result !== "object") throw new Error("Codex usage unavailable");
+    state.codexUsage.set(session.sessionId, result);
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    state.loadingCodexUsage.delete(session.sessionId);
+    if (state.selectedId === session.sessionId) updateCodexUsage(state.sessions.find((item) => item.sessionId === session.sessionId));
+  }
+}
+
 async function loadDiff() {
   const sessionId = state.selectedId;
   if (!sessionId) return;
@@ -732,17 +950,16 @@ async function sendInstruction(event) {
   button.classList.add("is-sending");
   button.setAttribute("aria-label", "送信中");
   try {
-    const result = await api(`/api/sessions/${encodeURIComponent(session.sessionId)}/instruction`, {
+    await api(`/api/sessions/${encodeURIComponent(session.sessionId)}/instruction`, {
       method: "POST", body: JSON.stringify({ text: value }),
     });
     const sent = state.sentMessages.get(session.sessionId) || [];
     sent.push({ id: `local-${Date.now()}`, at: new Date().toISOString(), text: value });
     state.sentMessages.set(session.sessionId, sent.slice(-100));
+    state.drafts.delete(session.sessionId);
     composer.value = "";
-    composer.style.height = "auto";
-    if (state.transcriptEnabled) void refreshTranscript();
-    else renderMessages(true);
-    showToast(result.accepted ? "Pi に指示を送りました。" : "Pi が指示を受け付けました。");
+    resizeComposer();
+    renderMessages(true);
   } catch (error) {
     showToast(error.message, "error");
   } finally {
@@ -756,13 +973,25 @@ async function sendInstruction(event) {
 
 function applySnapshot(payload) {
   const previousSelection = state.selectedId;
+  const previousSession = state.sessions.find((item) => item.sessionId === previousSelection);
   const nextSessions = Array.isArray(payload.sessions) ? payload.sessions : [];
-  const signature = JSON.stringify(nextSessions);
-  state.sessions = nextSessions;
   setConnection(payload.connected === true);
-  if (!state.selectedId || !state.sessions.some((session) => session.sessionId === state.selectedId)) {
-    state.selectedId = state.sessions[0]?.sessionId || null;
+  if (payload.connected !== true && nextSessions.length === 0 && state.sessions.length > 0) {
+    for (const session of state.sessions) session.connected = false;
+    state.sessionSignature = JSON.stringify(state.sessions);
+    renderSessionList();
+    updateHeader(state.sessions.find((item) => item.sessionId === state.selectedId));
+    return;
   }
+  const signature = JSON.stringify(nextSessions);
+  const nextSelection = !state.selectedId || !nextSessions.some((session) => session.sessionId === state.selectedId)
+    ? nextSessions[0]?.sessionId || null : state.selectedId;
+  if (previousSelection && previousSelection !== nextSelection) {
+    state.drafts.set(previousSelection, composer.value);
+    state.scrollPositions.set(previousSelection, messageList.scrollTop);
+  }
+  state.sessions = nextSessions;
+  state.selectedId = nextSelection;
   if (signature !== state.sessionSignature) {
     state.sessionSignature = signature;
     renderSessionList();
@@ -774,26 +1003,26 @@ function applySnapshot(payload) {
     cancelTranscriptRequest();
     state.transcripts.clear();
     state.transcriptCursors.clear();
+    composer.value = state.drafts.get(state.selectedId) || "";
+    resizeComposer();
     updateTranscriptControl();
     renderMessages(true);
-    if (state.selectedId) void refreshDetails(true);
-  }
-}
-
-function clearRefreshTimer() {
-  if (state.refreshTimer !== null) {
-    clearInterval(state.refreshTimer);
-    state.refreshTimer = null;
+    if (state.selectedId) restoreSessionScroll(state.selectedId);
+    if (state.selectedId) {
+      void refreshDetails(true);
+      void loadModels(state.selectedId);
+    }
+  } else if (selected?.connected && previousSession && Number.isSafeInteger(selected.eventSeq) && selected.eventSeq !== previousSession.eventSeq) {
+    void refreshDetails(false);
   }
 }
 
 function stopActiveConnection() {
-  clearRefreshTimer();
   cancelAllDetailRefreshes();
   cancelTranscriptRequest();
   const stream = state.stream;
-  if (stream) state.refreshAfterResume = true;
   state.liveConnected = false;
+  state.detailRefreshAgain.clear();
   state.stream = null;
   stream?.close();
 }
@@ -806,26 +1035,18 @@ function startActiveConnection() {
     stream.addEventListener("open", () => {
       if (state.stream !== stream) return;
       state.liveConnected = true;
-      if (state.refreshTimer === null) {
-        state.refreshTimer = setInterval(() => {
-          const session = state.sessions.find((item) => item.sessionId === state.selectedId);
-          if (state.liveConnected && state.connected && session?.connected && document.visibilityState !== "hidden") void refreshDetails(false);
-        }, 8000);
+      const session = state.sessions.find((item) => item.sessionId === state.selectedId);
+      if (session?.connected) {
+        void refreshDetails(false);
+        void loadModels(session.sessionId);
       }
     });
     stream.addEventListener("message", (event) => {
-      const previousSelection = state.selectedId;
       try { applySnapshot(JSON.parse(event.data)); } catch { return; }
-      if (state.refreshAfterResume) {
-        state.refreshAfterResume = false;
-        if (state.selectedId && state.selectedId === previousSelection) void refreshDetails(false);
-      }
     });
     stream.addEventListener("error", () => {
       if (state.stream !== stream) return;
       state.liveConnected = false;
-      state.refreshAfterResume = true;
-      clearRefreshTimer();
       setConnection(false);
     });
   }
@@ -848,15 +1069,35 @@ document.addEventListener("keydown", (event) => {
 $("#refresh-button").addEventListener("click", refreshSessions);
 $("#session-info-button").addEventListener("click", () => sessionInfo.showModal());
 $("#close-info").addEventListener("click", () => sessionInfo.close());
+$("#model-button").addEventListener("click", () => void openModelDialog());
+$("#close-model").addEventListener("click", () => $("#model-dialog").close());
+$("#model-search").addEventListener("input", renderModelList);
+$("#privacy-info-button").addEventListener("click", () => $("#privacy-info").showModal());
+$("#close-privacy").addEventListener("click", () => $("#privacy-info").close());
+$("#model-dialog").addEventListener("click", (event) => {
+  if (event.target === $("#model-dialog")) $("#model-dialog").close();
+});
+$("#privacy-info").addEventListener("click", (event) => {
+  if (event.target === $("#privacy-info")) $("#privacy-info").close();
+});
 sessionInfo.addEventListener("click", (event) => {
   if (event.target === sessionInfo) sessionInfo.close();
 });
 $("#diff-button").addEventListener("click", loadDiff);
+$("#codex-usage-refresh").addEventListener("click", loadCodexUsage);
 $("#transcript-toggle").addEventListener("click", toggleTranscript);
+$("#jump-latest").addEventListener("click", () => {
+  messageList.scrollTop = messageList.scrollHeight;
+  updateJumpButton();
+});
+messageList.addEventListener("scroll", () => {
+  if (state.selectedId) state.scrollPositions.set(state.selectedId, messageList.scrollTop);
+  updateJumpButton();
+}, { passive: true });
 $("#instruction-form").addEventListener("submit", sendInstruction);
 composer.addEventListener("input", () => {
-  composer.style.height = "auto";
-  composer.style.height = `${Math.min(composer.scrollHeight, 176)}px`;
+  resizeComposer();
+  if (state.selectedId) state.drafts.set(state.selectedId, composer.value);
 });
 composer.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
@@ -870,6 +1111,16 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("pagehide", stopActiveConnection);
 window.addEventListener("pageshow", startActiveConnection);
+function syncVisualViewport() {
+  const viewport = window.visualViewport;
+  if (!viewport) return;
+  document.documentElement.style.setProperty("--viewport-height", `${Math.round(viewport.height)}px`);
+  document.documentElement.style.setProperty("--viewport-top", `${Math.round(viewport.offsetTop)}px`);
+}
+syncVisualViewport();
+window.addEventListener("resize", syncVisualViewport, { passive: true });
+window.visualViewport?.addEventListener("resize", syncVisualViewport, { passive: true });
+window.visualViewport?.addEventListener("scroll", syncVisualViewport, { passive: true });
 startActiveConnection();
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => {}));

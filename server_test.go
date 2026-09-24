@@ -18,6 +18,8 @@ type fakeCall struct {
 	Command      string `json:"command"`
 	SessionID    string `json:"sessionId"`
 	Text         string `json:"text"`
+	Provider     string `json:"provider"`
+	ModelID      string `json:"modelId"`
 	After        int64  `json:"after"`
 	AfterEntryID string `json:"afterEntryId"`
 	ID           string `json:"id"`
@@ -58,13 +60,15 @@ func startFakeBridge(t *testing.T) (string, <-chan fakeCall) {
 					Command      string `json:"command"`
 					Session      string `json:"sessionId"`
 					Text         string `json:"text"`
+					Provider     string `json:"provider"`
+					ModelID      string `json:"modelId"`
 					After        int64  `json:"after"`
 					AfterEntryID string `json:"afterEntryId"`
 				}
 				if json.Unmarshal(line, &frame) != nil || frame.V != bridgeVersion || frame.Op != "request" {
 					return
 				}
-				request = fakeCall{Command: frame.Command, SessionID: frame.Session, Text: frame.Text, After: frame.After, AfterEntryID: frame.AfterEntryID, ID: frame.ID}
+				request = fakeCall{Command: frame.Command, SessionID: frame.Session, Text: frame.Text, Provider: frame.Provider, ModelID: frame.ModelID, After: frame.After, AfterEntryID: frame.AfterEntryID, ID: frame.ID}
 				select {
 				case calls <- request:
 				default:
@@ -77,6 +81,20 @@ func startFakeBridge(t *testing.T) (string, <-chan fakeCall) {
 					data = map[string]any{"events": []map[string]any{{"seq": 4, "at": "2026-09-24T12:00:00Z", "type": "ToolStarted", "summary": "read"}}, "cursor": 4, "dropped": false}
 				case "request_transcript":
 					data = map[string]any{"source": "pi-session", "cursor": "m1", "reset": true, "more": false, "truncated": false, "messages": []map[string]any{{"id": "m1", "role": "assistant", "at": "2026-09-24T12:00:00Z", "content": []map[string]any{{"type": "text", "text": "Unit-test transcript"}, {"type": "image", "mimeType": "image/png", "data": strings.Repeat("A", 96*1024)}}}}}
+				case "request_models":
+					catalog := make([]map[string]any, 200)
+					for index := range catalog {
+						catalog[index] = map[string]any{
+							"provider": "provider-" + strings.Repeat("p", 70),
+							"id":       fmt.Sprintf("%s%03d", strings.Repeat("m", 110), index),
+							"name":     strings.Repeat("model-name-", 10), "contextWindow": 200000, "reasoning": true,
+						}
+					}
+					data = map[string]any{"current": map[string]any{"provider": "anthropic", "id": "claude-sonnet"}, "models": catalog}
+				case "request_codex_usage":
+					data = map[string]any{"fiveHour": map[string]any{"usedPercent": 25, "resetAt": 1790000000}, "weekly": map[string]any{"usedPercent": 60, "resetAt": 1791000000}, "fetchedAt": 1780000000}
+				case "switch_model":
+					data = map[string]any{"current": map[string]any{"provider": frame.Provider, "id": frame.ModelID}}
 				case "request_task_state":
 					data = map[string]any{"source": "stepstone", "snapshotFound": true, "total": 1, "tasks": []map[string]any{{"id": "task_1", "title": "Inspect the change", "status": "doing"}}}
 				case "request_diff":
@@ -217,8 +235,74 @@ func TestAPIUsesOnlyScopedBridgeCommands(t *testing.T) {
 		t.Fatalf("unexpected diff bridge call: %+v", call)
 	}
 
+	response, err = http.Get(server.URL + "/api/sessions/sess_1/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var models map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&models); err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || models["current"] == nil || len(models["models"].([]any)) != 200 {
+		t.Fatalf("unexpected models response: status=%d body=%v", response.StatusCode, models)
+	}
+	if call := <-calls; call.Command != "request_models" || call.SessionID != "sess_1" {
+		t.Fatalf("unexpected model-list bridge call: %+v", call)
+	}
+
+	response, err = http.Get(server.URL + "/api/sessions/sess_1/codex-usage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var codexUsage map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&codexUsage); err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || response.Header.Get("Cache-Control") != "no-store" || codexUsage["fiveHour"].(map[string]any)["usedPercent"] != float64(25) {
+		t.Fatalf("unexpected Codex usage response: status=%d body=%v", response.StatusCode, codexUsage)
+	}
+	if call := <-calls; call.Command != "request_codex_usage" || call.SessionID != "sess_1" {
+		t.Fatalf("unexpected Codex usage bridge call: %+v", call)
+	}
+
+	request, _ := http.NewRequest(http.MethodPost, server.URL+"/api/sessions/sess_1/model", strings.NewReader(`{"provider":"anthropic","modelId":"claude-opus"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var modelSwitch map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&modelSwitch); err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("model switch returned %d: %v", response.StatusCode, modelSwitch)
+	}
+	if call := <-calls; call.Command != "switch_model" || call.SessionID != "sess_1" || call.Provider != "anthropic" || call.ModelID != "claude-opus" {
+		t.Fatalf("unexpected model-switch bridge call: %+v", call)
+	}
+
+	request, _ = http.NewRequest(http.MethodPost, server.URL+"/api/sessions/sess_1/model", strings.NewReader(`{"provider":"anthropic","modelId":" "}`))
+	request.Header.Set("Content-Type", "application/json")
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid model ref was not rejected: %d", response.StatusCode)
+	}
+	select {
+	case call := <-calls:
+		t.Fatalf("invalid model ref reached bridge: %+v", call)
+	default:
+	}
+
 	body := strings.NewReader(`{"text":"Please inspect the failure"}`)
-	request, _ := http.NewRequest(http.MethodPost, server.URL+"/api/sessions/sess_1/instruction", body)
+	request, _ = http.NewRequest(http.MethodPost, server.URL+"/api/sessions/sess_1/instruction", body)
 	request.Header.Set("Content-Type", "application/json")
 	response, err = http.DefaultClient.Do(request)
 	if err != nil {

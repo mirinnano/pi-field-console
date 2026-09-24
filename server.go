@@ -26,6 +26,7 @@ import (
 const (
 	bridgeVersion           = 1
 	maxBridgeLine           = 64 * 1024
+	maxModelBridgeLine      = 512 * 1024
 	maxTranscriptBridgeLine = 8 * 1024 * 1024
 	maxInstruction          = 8000
 )
@@ -63,6 +64,9 @@ func (s *service) handler(cfg config, assets fs.FS) http.Handler {
 	mux.HandleFunc("GET /api/sessions/{sessionID}/transcript", s.handleTranscript)
 	mux.HandleFunc("GET /api/sessions/{sessionID}/tasks", s.handleTasks)
 	mux.HandleFunc("GET /api/sessions/{sessionID}/diff", s.handleDiff)
+	mux.HandleFunc("GET /api/sessions/{sessionID}/models", s.handleModels)
+	mux.HandleFunc("GET /api/sessions/{sessionID}/codex-usage", s.handleCodexUsage)
+	mux.HandleFunc("POST /api/sessions/{sessionID}/model", s.handleModel)
 	mux.HandleFunc("POST /api/sessions/{sessionID}/instruction", s.handleInstruction)
 	mux.HandleFunc("GET /api/live", s.handleLive)
 
@@ -201,6 +205,56 @@ func (s *service) handleDiff(w http.ResponseWriter, r *http.Request) {
 	s.handleSessionCommand(w, r, "request_diff", nil)
 }
 
+func (s *service) handleModels(w http.ResponseWriter, r *http.Request) {
+	s.handleSessionCommand(w, r, "request_models", nil)
+}
+
+func (s *service) handleCodexUsage(w http.ResponseWriter, r *http.Request) {
+	s.handleSessionCommand(w, r, "request_codex_usage", nil)
+}
+
+func (s *service) handleModel(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("sessionID")
+	if !validSessionID(sessionID) {
+		writeError(w, http.StatusBadRequest, "invalid session id")
+		return
+	}
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var input struct {
+		Provider string `json:"provider"`
+		ModelID  string `json:"modelId"`
+	}
+	if err := decoder.Decode(&input); err != nil || !validModelRefPart(input.Provider) || !validModelRefPart(input.ModelID) {
+		writeError(w, http.StatusBadRequest, "invalid model")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid model")
+		return
+	}
+	data, err := s.bridgeRequest(r.Context(), "switch_model", sessionID, map[string]any{"provider": input.Provider, "modelId": input.ModelID})
+	if err != nil {
+		writeBridgeError(w, err)
+		return
+	}
+	writeRawJSON(w, http.StatusAccepted, data)
+}
+
+func validModelRefPart(value string) bool {
+	if value == "" || len(value) > 120 || strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *service) handleSessionCommand(w http.ResponseWriter, r *http.Request, command string, fields map[string]any) {
 	sessionID := r.PathValue("sessionID")
 	if !validSessionID(sessionID) {
@@ -251,7 +305,8 @@ func (s *service) handleInstruction(w http.ResponseWriter, r *http.Request) {
 func (s *service) bridgeRequest(ctx context.Context, command, sessionID string, fields map[string]any) (json.RawMessage, error) {
 	allowed := map[string]bool{
 		"request_status": true, "request_events": true, "request_task_state": true,
-		"request_transcript": true, "request_diff": true, "send_instruction": true,
+		"request_transcript": true, "request_diff": true, "request_models": true,
+		"request_codex_usage": true, "switch_model": true, "send_instruction": true,
 	}
 	if !allowed[command] {
 		return nil, errors.New("command not allowed")
@@ -296,6 +351,8 @@ func (s *service) bridgeRequest(ctx context.Context, command, sessionID string, 
 	responseLimit := maxBridgeLine
 	if command == "request_transcript" {
 		responseLimit = maxTranscriptBridgeLine
+	} else if command == "request_models" {
+		responseLimit = maxModelBridgeLine
 	}
 	reader := bufio.NewReaderSize(conn, responseLimit)
 	line, err := reader.ReadSlice('\n')
@@ -336,9 +393,9 @@ func writeBridgeError(w http.ResponseWriter, err error) {
 		status := http.StatusBadGateway
 		if upstream.message == "unknown session" {
 			status = http.StatusNotFound
-		} else if upstream.message == "session offline" {
+		} else if upstream.message == "session offline" || upstream.message == "session busy" {
 			status = http.StatusConflict
-		} else if upstream.message == "invalid instruction" {
+		} else if upstream.message == "invalid instruction" || upstream.message == "invalid model" || upstream.message == "model unavailable" {
 			status = http.StatusBadRequest
 		} else if upstream.message == "unknown command" || upstream.message == "unsupported command" || upstream.message == "not implemented in this milestone" {
 			status = http.StatusNotImplemented

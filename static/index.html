@@ -3,30 +3,30 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#171918">
-  <meta name="description" content="Pi の実行状況を確認し、フォローアップを送るためのチャット画面です。">
+  <meta name="theme-color" content="#080808">
+  <meta name="description" content="Pi のセッションを確認して、指示を送る。">
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/app.css">
-  <title>Pi リモートチャット</title>
+  <title>Pi</title>
 </head>
 <body>
   <div class="app-shell">
     <header class="topbar">
-      <button id="sessions-toggle" class="header-icon menu-button" type="button" aria-label="セッション一覧を開く" aria-controls="session-sidebar" aria-expanded="false">
+      <button id="sessions-toggle" class="header-icon menu-button" type="button" aria-label="セッション一覧" aria-controls="session-sidebar" aria-expanded="false">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
       </button>
-      <a class="brand" href="/" aria-label="Pi リモートチャット">
-        <span class="brand-mark" aria-hidden="true">π</span>
-        <span>Pi <i>チャット</i></span>
-      </a>
+      <a class="brand" href="/" aria-label="Pi"><span class="brand-mark" aria-hidden="true">π</span></a>
       <div class="current-session" aria-live="polite">
-        <div class="current-title"><strong id="current-name">セッションを選択</strong><span id="session-status" class="session-status" hidden></span></div>
-        <span id="current-path">Pi の作業状況をここに表示します</span>
+        <div class="current-title"><strong id="current-name">セッション</strong><span id="session-status" class="session-status" hidden></span></div>
+        <div class="current-meta">
+          <button id="model-button" class="model-button" type="button" aria-haspopup="dialog" aria-controls="model-dialog" disabled>モデル</button>
+          <span id="current-path"></span>
+        </div>
       </div>
       <div class="topbar-actions">
-        <span id="connection-state" class="connection-state" data-state="offline"><span class="pulse"></span><span>接続待ち</span></span>
-        <button id="session-info-button" class="header-icon" type="button" aria-label="セッション情報を表示" title="セッション情報">
+        <span id="connection-state" class="connection-state" data-state="offline" aria-label="接続待ち" title="接続待ち"><span class="pulse"></span><span>待機</span></span>
+        <button id="session-info-button" class="header-icon" type="button" aria-label="詳細">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg>
         </button>
       </div>
@@ -34,76 +34,104 @@
 
     <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
     <div class="main-layout">
-      <aside id="session-sidebar" class="session-sidebar" aria-label="Pi セッション一覧">
+      <aside id="session-sidebar" class="session-sidebar" aria-label="セッション一覧">
         <div class="sidebar-heading">
-          <div>
-            <p class="eyebrow">PI HARNESS</p>
-            <h1>セッション <span id="session-count" class="session-count">0</span></h1>
-          </div>
-          <button id="refresh-button" class="header-icon refresh-button" type="button" aria-label="セッションを更新" title="更新">
+          <h1>セッション <span id="session-count" class="session-count">0</span></h1>
+          <button id="refresh-button" class="header-icon refresh-button" type="button" aria-label="更新" title="更新">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4.7 16.7A8 8 0 0 0 18.8 18M4 17v-5h5M19.3 7.3A8 8 0 0 0 5.2 6"/></svg>
           </button>
         </div>
         <div id="session-list" class="session-list"></div>
-        <div id="empty-sessions" class="empty-sessions" hidden>
-          <span aria-hidden="true">⌁</span>
-          <strong>セッションがありません</strong>
-          <p>Pi を起動し、bridge extension を読み込むと一覧に表示されます。</p>
-        </div>
-        <div class="sidebar-note"><span class="note-dot"></span><span>送信した指示は選択中の Pi にだけ届きます。</span></div>
+        <div id="empty-sessions" class="empty-sessions" hidden>セッションなし</div>
       </aside>
 
       <main class="chat-view">
-        <div class="thread-notice" role="note">
-          <span class="notice-icon" aria-hidden="true">i</span>
-          <p id="transcript-notice">会話本文・ツール呼び出し／出力・画像は既定でこのブラウザへ同期されます。system prompt・thinking は含まず、会話本文をサーバーには保存しません。</p>
-          <button id="transcript-toggle" class="text-button" type="button" aria-controls="message-list" aria-pressed="true" disabled>会話を隠す</button>
+        <div class="thread-toolbar">
+          <div class="usage-strip" aria-label="トークン使用量">
+            <div class="context-line"><span>Context</span><strong id="context-value">—</strong><span id="context-percent"></span></div>
+            <div class="context-track" aria-hidden="true"><span id="context-fill"></span></div>
+            <span id="token-value" class="token-value">Tokens —</span>
+          </div>
+          <div class="thread-actions">
+            <button id="privacy-info-button" class="header-icon small-icon" type="button" aria-label="同期について" title="同期について">i</button>
+            <button id="transcript-toggle" class="text-button" type="button" aria-controls="message-list" aria-pressed="true" disabled>非表示</button>
+          </div>
         </div>
-        <section id="message-list" class="message-list" role="log" aria-label="セッションの会話と作業イベント" aria-relevant="additions">
+        <section id="message-list" class="message-list" role="log" aria-label="会話" aria-relevant="additions">
           <div id="chat-empty" class="chat-empty">
             <span class="empty-avatar" aria-hidden="true">π</span>
-            <h2>Pi と作業を続ける</h2>
-            <p>セッションを選ぶと、作業イベントと送信した指示がここに並びます。</p>
+            <h2>Pi</h2>
           </div>
         </section>
+        <button id="jump-latest" class="jump-latest" type="button" aria-label="最新へ移動" title="最新へ移動" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
+        </button>
         <form id="instruction-form" class="composer">
-          <label class="sr-only" for="instruction-text">Pi への指示</label>
+          <label class="sr-only" for="instruction-text">メッセージ</label>
           <div class="composer-box">
-            <textarea id="instruction-text" rows="1" maxlength="8000" placeholder="続けてほしい作業や、確認してほしい点を書く" required></textarea>
-            <button id="send-button" class="send-button" type="submit" aria-label="Pi に指示を送信" title="送信" disabled>
+            <textarea id="instruction-text" rows="1" maxlength="8000" placeholder="メッセージ" required></textarea>
+            <button id="send-button" class="send-button" type="submit" aria-label="送信" title="送信" disabled>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"/></svg>
             </button>
           </div>
           <div class="composer-footer">
-            <span id="composer-hint">指示は Pi への follow-up として送信します。</span>
-            <span class="keyboard-hint">Enter で送信、Shift+Enter で改行</span>
+            <span id="composer-hint">追送</span>
+            <span class="keyboard-hint">Enter 送信 · Shift+Enter 改行</span>
           </div>
         </form>
       </main>
     </div>
   </div>
 
+  <dialog id="model-dialog" class="model-dialog" aria-labelledby="model-title">
+    <div class="dialog-heading">
+      <h2 id="model-title">モデル</h2>
+      <button id="close-model" class="header-icon" type="button" aria-label="閉じる"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+    </div>
+    <label class="sr-only" for="model-search">モデルを検索</label>
+    <input id="model-search" class="model-search" type="search" placeholder="検索" autocomplete="off">
+    <div id="model-list" class="model-list" role="listbox" aria-label="利用可能なモデル"></div>
+    <p id="model-empty" class="info-empty" hidden>モデルなし</p>
+  </dialog>
+
   <dialog id="session-info" class="info-dialog" aria-labelledby="info-title">
     <div class="dialog-heading">
-      <div><p class="eyebrow">セッション情報</p><h2 id="info-title">セッション情報</h2></div>
+      <h2 id="info-title">詳細</h2>
       <button id="close-info" class="header-icon" type="button" aria-label="閉じる">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
       </button>
     </div>
-    <p id="info-path" class="info-path">セッションを選択してください</p>
+    <p id="info-path" class="info-path"></p>
     <div class="info-metrics">
-      <div class="metric"><span>ツール呼び出し</span><strong id="metric-tools">—</strong></div>
-      <div class="metric"><span>実行回数</span><strong id="metric-runs">—</strong></div>
-      <div class="metric"><span>モデル費用</span><strong id="metric-cost">—</strong></div>
+      <div class="metric"><span>ツール</span><strong id="metric-tools">—</strong></div>
+      <div class="metric"><span>実行</span><strong id="metric-runs">—</strong></div>
+      <div class="metric"><span>費用</span><strong id="metric-cost">—</strong></div>
     </div>
-    <section class="info-section">
-      <div class="section-heading"><h3>作業タスク</h3><span id="task-count" class="section-count">未取得</span></div>
-      <div id="task-list" class="task-list"><p class="info-empty">セッションを選ぶとタスクを読み込みます。</p></div>
+    <section id="codex-usage-section" class="info-section" hidden>
+      <div class="section-heading"><h3>Codex</h3><button id="codex-usage-refresh" class="text-button" type="button">取得</button></div>
+      <div class="quota-rows">
+        <div class="quota-row"><span>5h</span><div id="codex-5h-track" class="quota-track" role="progressbar" aria-label="Codex 5時間使用率" aria-valuemin="0" aria-valuemax="100"><span id="codex-5h-fill"></span></div><strong id="codex-5h-value">—</strong><time id="codex-5h-reset" class="quota-reset"></time></div>
+        <div class="quota-row"><span>7d</span><div id="codex-7d-track" class="quota-track" role="progressbar" aria-label="Codex 7日使用率" aria-valuemin="0" aria-valuemax="100"><span id="codex-7d-fill"></span></div><strong id="codex-7d-value">—</strong><time id="codex-7d-reset" class="quota-reset"></time></div>
+      </div>
     </section>
     <section class="info-section">
-      <div class="section-heading"><h3>変更概要</h3><button id="diff-button" class="text-button" type="button">取得</button></div>
-      <pre id="diff-summary" class="diff-summary">必要なときに取得します。</pre>
+      <div class="section-heading"><h3>タスク</h3><span id="task-count" class="section-count">—</span></div>
+      <div id="task-list" class="task-list"></div>
     </section>
+    <section class="info-section">
+      <div class="section-heading"><h3>差分</h3><button id="diff-button" class="text-button" type="button">取得</button></div>
+      <pre id="diff-summary" class="diff-summary"></pre>
+    </section>
+  </dialog>
+
+  <dialog id="privacy-info" class="privacy-dialog" aria-labelledby="privacy-title">
+    <div class="dialog-heading">
+      <h2 id="privacy-title">同期</h2>
+      <button id="close-privacy" class="header-icon" type="button" aria-label="閉じる">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+      </button>
+    </div>
+    <p>会話・ツール出力・画像をブラウザに同期します。system prompt と thinking は除外。アクセスできる人には表示されます。</p>
   </dialog>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>

@@ -1,12 +1,12 @@
 {
-  "name": "Pi リモートチャット",
-  "short_name": "Pi チャット",
-  "description": "Pi の会話本文・ツール出力・画像を表示し、フォローアップを送信します。",
+  "name": "Pi Console",
+  "short_name": "Pi",
+  "description": "Pi セッション用チャット画面",
   "lang": "ja",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#171918",
-  "theme_color": "#171918",
+  "background_color": "#080808",
+  "theme_color": "#080808",
   "icons": [
     { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
   ]

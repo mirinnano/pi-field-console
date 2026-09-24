@@ -2,11 +2,18 @@
 
 A small Go HTTP/SSE gateway and installable mobile-first PWA for the **already-running Pi sessions registered with pi-harness**. It does not start a second Pi runtime and does not expose the bridge Unix socket to the browser.
 
-The UI syncs the active, compaction-aware conversation by default, including user/assistant text, tool calls and arguments, tool outputs, bash commands and statuses, visible extension messages, and supported images. System prompts, hidden thinking, and compaction/branch summaries are excluded. Transcript frames are size-bounded and fetched incrementally; they are not written to bridge snapshots or event logs. The browser keeps at most 200 entries / 6 MiB in memory, does not cache API responses, and drops the oldest entries at that display limit. Use **会話を隠す** to stop sync, abort an in-flight request, and clear the displayed transcript.
+The UI syncs the active, compaction-aware conversation by default, including user/assistant text, tool calls and arguments, tool outputs, bash commands and statuses, visible extension messages, and supported images. System prompts, hidden thinking, and compaction/branch summaries are excluded. Transcript frames are size-bounded and fetched incrementally; they are not written to bridge snapshots or event logs. The browser keeps at most 200 entries / 6 MiB in memory, does not cache API responses, and drops the oldest entries at that display limit. Use **隠す** to stop sync, abort an in-flight request, and clear the displayed transcript.
 
-The lightweight HTTP listener stays available so a new browser can wake the console. Background bridge status polling runs only while at least one live browser connection is open, and stops when the last connection closes. The browser closes its live stream and periodic detail refresh while hidden; explicit requests still run on demand. Thus the Go process remains idle-ready, but does not continuously poll the Pi bridge without an active page.
+The HTTP listener stays available; bridge status polling runs only while an SSE client is connected. Status snapshots are checked every 3 seconds. When a session's event sequence changes, the browser fetches its event and transcript deltas; hidden pages close SSE and abort reads. There is no fixed detail-refresh timer.
 
-The only write operation is `send_instruction`, delivered to Pi as a follow-up user message. There is no shell, approval, pause, or arbitrary command endpoint.
+The console can send a follow-up, switch the active session's model while Pi is idle, and explicitly fetch Codex 5-hour / 7-day quota while using an `openai-codex` model.
+Model changes do not alter Pi's default.
+Context tokens are Pi's current context estimate; the session token total adds main-model, subagent, and external-model input/output where reported.
+Codex quota is a separate account-level value.
+Quota lookup is user-triggered, uses Pi's in-process auth, and returns only usage percentages/reset times to the browser.
+It follows the request pattern in [`pi-chatgpt-limit`](https://github.com/patlux/pi-chatgpt-limit); that extension has no stable API, so this app does not install it or depend on private module exports.
+The fixed `chatgpt.com/backend-api/wham/usage` endpoint is undocumented and may change.
+No shell, approval, pause, or arbitrary command endpoint is exposed.
 
 ## UI reference
 
@@ -14,18 +21,23 @@ The conversation layout follows patterns visible in the public Codex CLI/TUI sou
 
 The public repository describes `codex app` as the desktop experience, but its desktop UI implementation is not included in the open-source CLI repository. This implementation therefore references the published TUI source, not private desktop code.
 
-## Enable transcript support in pi-harness
+The mobile drawer, transcript-follow behavior, and composer also borrow small interaction patterns from [agegr/pi-web](https://github.com/agegr/pi-web) and [khangkontum/pi-web](https://github.com/khangkontum/pi-web): visual-viewport sizing for the keyboard, per-session in-memory drafts/scroll positions, and a quiet jump-to-latest control.
+No source files are copied.
+UI text uses Noto Sans CJK when installed; conversation text uses Noto Serif CJK; code/model labels prefer Nerd Fonts.
+All have system fallbacks and are not bundled.
 
-The companion patch updates the pi-harness bridge protocol and extension to supply transcript snapshots. It targets pi-harness commit `ea1b2f32eda2fcba326717b2f2e9fb08b8be9ee7` and changes only the files included in [`integrations/pi-harness-transcript.patch`](integrations/pi-harness-transcript.patch).
+## Enable the web console in pi-harness
+
+The companion patch updates the pi-harness bridge and extension for transcript sync, model listing/switching, context telemetry, action-sequence refreshes, and on-demand Codex quota. Model metadata is allowlisted; API URLs and headers are not exposed. Switching validates an exact available-model pair and is session-local. Codex usage uses Pi's active Codex credential only inside the extension process; the browser receives 5-hour / 7-day percentages and reset times, never the token, email, or plan. It targets pi-harness commit `ea1b2f32eda2fcba326717b2f2e9fb08b8be9ee7` and changes only the files included in [`integrations/pi-harness-console.patch`](integrations/pi-harness-console.patch).
 
 ```sh
 cd /path/to/pi-harness
-git apply /path/to/pi-field-console/integrations/pi-harness-transcript.patch
+git apply --unidiff-zero /path/to/pi-field-console/integrations/pi-harness-console.patch
 npm run check
 npm test
 ```
 
-Restart the pi-harness bridge daemon and Pi sessions after applying the patch. Older bridge versions continue to support status, events, and follow-up instructions, but not transcript sync.
+Restart the pi-harness bridge daemon and Pi sessions after applying the patch. Older bridge versions support basic status, events, and follow-up instructions, but not transcript sync, model switching, or Codex usage.
 
 ## Run locally
 
@@ -57,7 +69,7 @@ PI_REMOTE_ALLOWED_ORIGINS=https://pi-host.example-tailnet.ts.net \
 go run .
 ```
 
-Configure the proxy to forward HTTPS traffic to `http://127.0.0.1:8765`; verify its ACL and host/origin forwarding before enabling it. The PWA is a control surface for the currently loaded Pi session, so anyone admitted by that proxy can send follow-up instructions.
+Configure the proxy to forward HTTPS traffic to `http://127.0.0.1:8765`; verify its ACL and host/origin forwarding before enabling it. The PWA is a control surface for loaded Pi sessions, so anyone admitted by that proxy can send follow-ups and switch the active model.
 
 ## Checks
 
