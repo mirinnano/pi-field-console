@@ -33,7 +33,7 @@ Two companion patches update pi-harness. The core patch adds transcript sync, mo
 ```sh
 cd /path/to/pi-harness
 git apply --unidiff-zero /path/to/pi-field-console/integrations/pi-harness-console.patch
-git apply /path/to/pi-field-console/integrations/pi-harness-herdr.patch
+git apply --unidiff-zero /path/to/pi-field-console/integrations/pi-harness-herdr.patch
 npm run check
 npm test
 ```
