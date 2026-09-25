@@ -116,6 +116,39 @@ func TestHistoryListUsesHeaderCWDAndDoesNotExposeMessageBodies(t *testing.T) {
 	}
 }
 
+func TestDiscoveredRootsAreIndexedOnTheNextSingleRefresh(t *testing.T) {
+	firstRoot, secondRoot := t.TempDir(), t.TempDir()
+	firstPath := writeHistorySession(t, firstRoot, "first.jsonl", "first-session", "/first", 3)
+	writeHistorySession(t, secondRoot, "second.jsonl", "second-session", "/second", 3)
+	index := newSessionHistory([]string{firstRoot})
+	if len(index.List()) != 1 {
+		t.Fatal("initial root was not indexed")
+	}
+
+	index.mu.Lock()
+	cached := index.metadataCache[firstPath]
+	cached.metadata.Name = "cached metadata"
+	index.metadataCache[firstPath] = cached
+	index.mu.Unlock()
+
+	index.setRootsForNextRefresh([]string{firstRoot, secondRoot})
+	if len(index.sessions) != 1 {
+		t.Fatal("discovered roots were scanned eagerly before the request's index read")
+	}
+	listed := index.List()
+	if len(listed) != 2 {
+		t.Fatalf("next index refresh returned %d sessions, want both roots: %#v", len(listed), listed)
+	}
+	for _, item := range listed {
+		if item.SessionID == "first-session" && item.Name != "cached metadata" {
+			t.Fatalf("unchanged-root metadata cache was discarded: %#v", item)
+		}
+	}
+	if len(index.SessionFiles()) != 2 {
+		t.Fatalf("SessionFiles failed to reflect both roots: %#v", index.SessionFiles())
+	}
+}
+
 func TestHistoryMetadataCacheAvoidsUnchangedTailReads(t *testing.T) {
 	root := t.TempDir()
 	path := writeHistorySession(t, root, "cached.jsonl", "cached-session", "/cached", 3,

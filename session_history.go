@@ -125,7 +125,7 @@ func newSessionHistory(roots []string) *sessionHistory {
 }
 
 // SetRoots replaces the complete search scope and rebuilds the index.
-func (h *sessionHistory) SetRoots(roots []string) {
+func normalizeHistoryRoots(roots []string) []string {
 	cleaned := make([]string, 0, min(len(roots), historyMaxRoots))
 	for _, root := range roots {
 		if len(cleaned) == historyMaxRoots {
@@ -136,11 +136,23 @@ func (h *sessionHistory) SetRoots(roots []string) {
 		}
 		cleaned = append(cleaned, filepath.Clean(root))
 	}
+	return cleaned
+}
+
+func (h *sessionHistory) SetRoots(roots []string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.roots = cleaned
+	h.roots = normalizeHistoryRoots(roots)
 	h.metadataCache = make(map[string]cachedHistoryMetadata)
 	h.rebuildLocked()
+}
+
+// setRootsForNextRefresh lets request handlers add discovered roots without
+// eagerly walking them; the next List or SessionFiles call performs one rebuild.
+func (h *sessionHistory) setRootsForNextRefresh(roots []string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.roots = normalizeHistoryRoots(roots)
 }
 
 // List returns a refreshed, bounded metadata index. Message bodies are not read here.

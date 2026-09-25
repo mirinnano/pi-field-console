@@ -400,7 +400,7 @@ func (s *service) addHistoryRoots(extra []string) {
 		changed = true
 	}
 	if changed {
-		s.history.SetRoots(s.historyRoots)
+		s.history.setRootsForNextRefresh(s.historyRoots)
 	}
 }
 
